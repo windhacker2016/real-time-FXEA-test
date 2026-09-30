@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fxea"
+version = "0.1.0"
+description = "全天候 AI 外匯交易員:研究、訊號、風險管理、監控循環與人工核准決策備忘錄"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.9",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pydantic>=2.5",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+mt5 = ["MetaTrader5"]  # 僅 Windows
+
+[project.scripts]
+fxea = "fxea.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fxea*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,67 @@
+# FXEA 預設設定(圖 2 底部:模式 掃描 / 頻率 持續 / 時間週期 全天候 / 狀態 啟用)
+watchlist: [EURUSD, GBPUSD, USDJPY, AUDUSD]
+timeframes: [H1, H4]
+
+data_source: synthetic   # synthetic | csv | mt5
+broker: paper            # paper | mt5
+state_dir: state
+synthetic_seed: 42
+# news_file: config/news.json
+
+scanner:
+  lookback: 200
+  volume_ratio_min: 1.2
+  change_pct_alert: 0.25
+  level_proximity_atr: 0.5
+  news_window_minutes: 120
+
+signals:
+  min_score: 60
+  max_per_symbol: 2
+  breakout_lookback: 20
+  rsi_period: 14
+
+planner:
+  min_risk_reward: 2.0
+  atr_stop_multiplier: 1.5
+  max_stop_atr: 3.0
+  stop_buffer_atr: 0.1
+  entry_zone_atr: 0.25
+  invalidation_atr: 0.5
+  target_atr_fallback: 3.0
+
+risk:
+  risk_per_trade_pct: 1.0
+  max_total_exposure_pct: 5.0
+  max_open_positions: 4
+  max_drawdown_pct: 10.0
+  max_daily_loss_pct: 3.0
+  volatility_percentile_band: [5, 95]
+  allow_same_symbol: false
+  news_blackout_minutes: 30
+
+research:
+  provider: rules          # rules | claude(需要 ANTHROPIC_API_KEY)
+  model: claude-fable-5-1  # 圖 1「模型:FABLE 5」;也可用 claude-fable-5
+  effort: high
+  fallbacks: true
+  timeout_seconds: 180
+  max_tokens: 4096
+
+approval:
+  mode: human              # human:等待你核准 / auto:紙上交易自動核准
+  pending_ttl_minutes: 240
+
+monitor:
+  interval_seconds: 60
+  proactive_review_every: 10
+  status_every: 5
+
+account:
+  currency: USD
+  starting_balance: 10000
+
+alerts:
+  console: true
+  file: alerts.jsonl
+  webhook_url: null
