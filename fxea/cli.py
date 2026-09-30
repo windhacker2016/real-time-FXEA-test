@@ -5,13 +5,16 @@
   fxea pending                                                列出等待人工審核的備忘錄
   fxea decide <memo_id> approve|watchlist|reject [--note ..]  人工決策
   fxea memo <memo_id>                                         顯示備忘錄
-  fxea status                                                 帳戶、部位、待審摘要
+  fxea status                                                 帳戶、部位、待審、風險模式摘要
+  fxea resume [--full-risk]                                   回撤斷路器暫停後,人工恢復交易
+  fxea backtest --csv-dir DIR [--from YYYY-MM-DD] ...         用 CSV 回放做回測
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .app import build_loop
@@ -19,6 +22,7 @@ from .approval import ApprovalGate
 from .config import Settings, load_settings
 from .memo import render_memo
 from .models import Decision
+from .risk import RiskGovernor
 from .state import StateStore
 
 
@@ -42,7 +46,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     reports = loop.run(cycles=args.cycles, interval=args.interval)
     last = reports[-1] if reports else None
     if last:
-        print(f"\n完成 {len(reports)} 輪;權益 {last.equity:.2f},回撤 {last.drawdown_pct:.2f}%,未平倉 {last.open_positions},待審 {last.pending_memos}")
+        print(f"\n完成 {len(reports)} 輪;權益 {last.equity:.2f},回撤 {last.drawdown_pct:.2f}%,未平倉 {last.open_positions},待審 {last.pending_memos},風險模式 {last.risk_mode.label_zh}")
     return 0
 
 
@@ -77,7 +81,11 @@ def cmd_pending(args: argparse.Namespace) -> int:
 
 def cmd_decide(args: argparse.Namespace) -> int:
     settings = _settings(args)
-    gate = ApprovalGate(StateStore(settings.state_dir), settings.approval)
+    store = StateStore(settings.state_dir)
+    gate = ApprovalGate(store, settings.approval)
+    governor = RiskGovernor(settings.risk, store)
+    if governor.halted and args.decision == "approve":
+        print(f"警告:風險模式為「暫停」({governor.state.halt_reason}),核准的備忘錄不會被執行;請先 fxea resume。", file=sys.stderr)
     try:
         memo = gate.decide(args.memo_id, Decision(args.decision), by=args.by, note=args.note)
     except (KeyError, ValueError) as exc:
@@ -106,12 +114,43 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("尚無狀態(先執行 fxea run)。")
         return 0
     print(f"時間 {status.get('time')}  第 {status.get('cycle')} 輪  運作 {status.get('uptime_seconds', 0) // 60} 分鐘  系統 {status.get('system')}")
-    print(f"權益 {status.get('equity')}  餘額 {status.get('balance')}  回撤 {status.get('drawdown_pct')}%  今日 {status.get('daily_pnl')}")
+    print(f"權益 {status.get('equity')}  餘額 {status.get('balance')}  回撤 {status.get('drawdown_pct')}%(高水位 {status.get('reference_peak')})  今日 {status.get('daily_pnl')}")
+    mode = status.get("risk_mode", "normal")
+    line = f"風險模式 {mode}  斷路器觸發 {status.get('halts', 0)} 次"
+    if mode == "halted":
+        line += f"\n  ⏸ 交易暫停中,自 {status.get('halted_at')}:{status.get('halt_reason')}\n  → 確認狀況後執行 fxea resume(或 fxea resume --full-risk)"
+    print(line)
     print(f"自選清單 {', '.join(status.get('watchlist', []))}")
     for p in status.get("open_positions", []):
         print(f"  部位 {p['position_id']} {p['symbol']} {p['direction']} {p['lots']} 手 @ {p['entry_price']} SL {p['stop_loss']} TP {p['take_profit']}")
     pend = status.get("pending_memos", [])
     print(f"待審備忘錄 {len(pend)}:{', '.join(pend) if pend else '-'}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    store = StateStore(settings.state_dir)
+    governor = RiskGovernor(settings.risk, store)
+    try:
+        t = governor.resume(datetime.now(timezone.utc), by=args.by, full_risk=args.full_risk)
+    except ValueError as exc:
+        print(f"錯誤:{exc}", file=sys.stderr)
+        return 1
+    store.journal({"type": "risk_state", "time": t.time.isoformat(), "from": t.from_mode.value, "to": t.to_mode.value, "reason": t.reason, "by": t.by})
+    print(f"風險模式:{t.from_mode.label_zh} → {t.to_mode.label_zh}\n{t.reason}")
+    return 0
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    from .backtest import format_report, parse_date, run_backtest
+
+    settings = _settings(args)
+    symbols = args.symbol or settings.watchlist
+    start = parse_date(args.start) if args.start else None
+    out = args.out or f"backtests/{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+    result = run_backtest(settings, args.csv_dir, symbols, start, out, cooldown_hours=args.cooldown_hours, warmup=args.warmup)
+    print(format_report(result))
     return 0
 
 
@@ -148,6 +187,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("status", help="狀態摘要")
     st.set_defaults(func=cmd_status)
+
+    rs = sub.add_parser("resume", help="回撤斷路器暫停後恢復交易")
+    rs.add_argument("--by", default="human")
+    rs.add_argument("--full-risk", action="store_true", help="直接回復全額風險(預設為恢復期、風險縮減)")
+    rs.set_defaults(func=cmd_resume)
+
+    bt = sub.add_parser("backtest", help="CSV 回放回測")
+    bt.add_argument("--csv-dir", required=True, help="含 {SYMBOL}_H1.csv 的資料夾")
+    bt.add_argument("--symbol", action="append", help="商品(可重複);預設用設定的自選清單")
+    bt.add_argument("--from", dest="start", help="正式起算日 YYYY-MM-DD(之前的資料只當暖機)")
+    bt.add_argument("--out", help="輸出資料夾(預設 backtests/<時間戳>)")
+    bt.add_argument("--cooldown-hours", type=int, default=72, help="回撤斷路器冷卻小時數(預設 72;0 = 觸發後不再交易)")
+    bt.add_argument("--warmup", type=int, default=300, help="指標暖機至少幾根 H1")
+    bt.set_defaults(func=cmd_backtest)
     return p
 
 

@@ -130,6 +130,30 @@ class AlertLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class RiskMode(str, Enum):
+    NORMAL = "normal"
+    HALTED = "halted"  # 觸及回撤上限:暫停開新倉,等待冷卻或人工 resume
+    RECOVERY = "recovery"  # 恢復交易但風險縮減,直到權益回到暫停前高點
+
+    @property
+    def label_zh(self) -> str:
+        return {"normal": "正常", "halted": "暫停", "recovery": "恢復期"}[self.value]
+
+
+class RiskState(BaseModel):
+    """回撤斷路器的狀態機(由 :class:`fxea.risk.RiskGovernor` 管理,持久化在 risk_state.json)。"""
+
+    mode: RiskMode = RiskMode.NORMAL
+    reference_peak: Optional[float] = None  # 目前用來量回撤的高水位
+    last_equity: Optional[float] = None
+    halted_at: Optional[datetime] = None
+    halt_reason: Optional[str] = None
+    peak_at_halt: Optional[float] = None  # 恢復期的目標:回到這個權益才回復全額風險
+    resumed_at: Optional[datetime] = None
+    resumed_by: Optional[str] = None
+    halts: int = 0
+
+
 class MemoStatus(str, Enum):
     READY = "ready"  # 可進行決策(所有檢查皆通過,等待人工核准)
     BLOCKED = "blocked"  # 風險模組未通過 → 阻擋
@@ -420,5 +444,6 @@ class CycleReport(BaseModel):
     alerts: list[Alert] = Field(default_factory=list)
     equity: float = 0.0
     drawdown_pct: float = 0.0
+    risk_mode: RiskMode = RiskMode.NORMAL
     open_positions: int = 0
     pending_memos: int = 0

@@ -1,10 +1,15 @@
 from datetime import timedelta
 
+import pytest
+
 from fxea.config import RiskConfig
-from fxea.models import Confidence, Direction, NewsEvent, Position, RiskRating, SignalType, Timeframe, TradePlan
-from fxea.risk import RiskModule
+from fxea.models import Confidence, Direction, NewsEvent, Position, RiskMode, RiskRating, SignalType, Timeframe, TradePlan
+from fxea.risk import RiskGovernor, RiskModule
+from fxea.state import StateStore
 
 from .helpers import T0, account, snapshot
+
+H = timedelta(hours=1)
 
 
 def plan(**kw) -> TradePlan:
@@ -99,3 +104,52 @@ def test_invalid_plan_fails_position_size():
 def test_too_small_account_yields_zero_lots():
     rep = RiskModule(RiskConfig()).evaluate(plan(), snapshot(), account(equity=50.0), [], T0)
     assert rep.lots == 0.0 and not rep.check("position_size").passed
+
+
+# ---- 回撤斷路器 ----------------------------------------------------------
+
+
+def test_governor_halt_cooldown_recovery_normal(tmp_path):
+    cfg = RiskConfig(max_drawdown_pct=10.0, drawdown_cooldown_hours=24, recovery_risk_scale=0.5)
+    g = RiskGovernor(cfg, StateStore(tmp_path))
+    assert g.update(account(10_000.0), T0) == [] and g.state.reference_peak == 10_000.0
+    assert g.update(account(11_000.0, peak=11_000.0), T0 + H) == [] and g.state.reference_peak == 11_000.0
+
+    (t,) = g.update(account(9_800.0, peak=11_000.0), T0 + 2 * H)  # 回撤 10.9%
+    assert t.to_mode is RiskMode.HALTED and g.halted and g.risk_scale == 0.0 and g.state.halts == 1
+    assert "10.91%" in t.reason
+    assert g.update(account(9_800.0, peak=11_000.0), T0 + 10 * H) == []  # 冷卻中,不再轉換
+
+    (t2,) = g.update(account(9_800.0, peak=11_000.0), T0 + 26 * H)  # 冷卻 24h 期滿
+    assert t2.to_mode is RiskMode.RECOVERY and t2.by == "auto"
+    assert g.state.reference_peak == 9_800.0 and g.risk_scale == 0.5 and g.state.peak_at_halt == 11_000.0
+    assert g.update(account(9_500.0, peak=11_000.0), T0 + 27 * H) == []  # 從新高水位算,回撤 3%
+    assert abs(g.drawdown_pct(9_500.0) - 3.0612) < 0.01
+
+    (t3,) = g.update(account(11_000.0, peak=11_000.0), T0 + 28 * H)  # 回到暫停前高點
+    assert t3.to_mode is RiskMode.NORMAL and g.risk_scale == 1.0
+
+    g2 = RiskGovernor(cfg, StateStore(tmp_path))  # 持久化
+    assert g2.mode is RiskMode.NORMAL and g2.state.halts == 1
+
+
+def test_governor_manual_resume_only(tmp_path):
+    cfg = RiskConfig(max_drawdown_pct=10.0, drawdown_cooldown_hours=0)
+    g = RiskGovernor(cfg, StateStore(tmp_path))
+    g.update(account(10_000.0), T0)
+    g.update(account(8_900.0, peak=10_000.0), T0 + H)
+    assert g.halted
+    assert g.update(account(8_900.0, peak=10_000.0), T0 + 1000 * H) == []  # 永遠不自動恢復
+    t = g.resume(T0 + 1001 * H, by="alice", full_risk=True)
+    assert t.to_mode is RiskMode.NORMAL and g.state.resumed_by == "alice" and g.state.reference_peak == 8_900.0
+    with pytest.raises(ValueError):
+        g.resume(T0 + 1002 * H)
+
+
+def test_evaluate_with_governor_inputs():
+    half = RiskModule(RiskConfig()).evaluate(plan(), snapshot(), account(), [], T0, risk_scale=0.5)
+    assert half.passed and half.lots == 0.1 and half.risk_amount == 50.0
+    dd = RiskModule(RiskConfig()).evaluate(plan(), snapshot(), account(), [], T0, drawdown_pct=12.0)
+    assert not dd.check("drawdown").passed
+    halted = RiskModule(RiskConfig()).evaluate(plan(), snapshot(), account(), [], T0, mode=RiskMode.HALTED, drawdown_pct=10.5)
+    assert not halted.check("drawdown").passed and "暫停" in halted.check("drawdown").detail

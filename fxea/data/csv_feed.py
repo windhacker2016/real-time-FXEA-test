@@ -15,7 +15,14 @@ from .base import MarketDataFeed
 
 
 class CsvFeed(MarketDataFeed):
-    def __init__(self, directory: str | Path, symbols: list[str], warmup: int = 300):
+    def __init__(
+        self,
+        directory: str | Path,
+        symbols: list[str],
+        warmup: int = 300,
+        warmup_until: datetime | None = None,
+    ):
+        """``warmup``:至少先給指標多少根歷史;``warmup_until``:從這個時間點才開始「現在」。"""
         self.dir = Path(directory)
         self.symbols = [s.upper() for s in symbols]
         self._h1: dict[str, pd.DataFrame] = {}
@@ -29,8 +36,12 @@ class CsvFeed(MarketDataFeed):
             if missing:
                 raise ValueError(f"{path} 缺少欄位 {missing}")
             df["time"] = pd.to_datetime(df["time"], utc=True)
-            self._h1[sym] = df[COLUMNS].sort_values("time").reset_index(drop=True)
-            self._cursor[sym] = min(warmup, len(df))
+            df = df[COLUMNS].sort_values("time").reset_index(drop=True)
+            self._h1[sym] = df
+            cursor = min(warmup, len(df))
+            if warmup_until is not None:
+                cursor = max(cursor, int((df["time"] < pd.Timestamp(warmup_until)).sum()))
+            self._cursor[sym] = min(cursor, len(df))
 
     def _visible(self, sym: str) -> pd.DataFrame:
         return self._h1[sym].iloc[: self._cursor[sym]]

@@ -42,6 +42,10 @@ class RiskConfig(BaseModel):
     volatility_percentile_band: tuple[float, float] = (5.0, 95.0)
     allow_same_symbol: bool = False
     news_blackout_minutes: int = 30
+    # 回撤斷路器:觸及 max_drawdown_pct → 暫停開新倉。
+    # drawdown_cooldown_hours > 0:冷卻期滿自動以縮減風險恢復;0:只能人工 `fxea resume`
+    drawdown_cooldown_hours: int = 0
+    recovery_risk_scale: float = 0.5  # 恢復期每筆風險縮放,直到權益回到暫停前高點
 
 
 class ResearchConfig(BaseModel):
@@ -68,6 +72,7 @@ class MonitorConfig(BaseModel):
 class AccountConfig(BaseModel):
     currency: str = "USD"
     starting_balance: float = 10_000.0
+    spread_pips: Optional[float] = None  # 紙上交易點差;None = 用商品預設,0 = 不計點差
 
 
 class AlertConfig(BaseModel):
@@ -104,6 +109,7 @@ class InstrumentOverride(BaseModel):
     lot_min: Optional[float] = None
     lot_max: Optional[float] = None
     lot_step: Optional[float] = None
+    spread_pips: Optional[float] = None
 
 
 class Settings(BaseModel):

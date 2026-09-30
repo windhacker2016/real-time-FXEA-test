@@ -59,6 +59,10 @@ risk:
   volatility_percentile_band: [5, 95]
   allow_same_symbol: false
   news_blackout_minutes: 30
+  # 回撤斷路器:觸及 max_drawdown_pct 後暫停開新倉並發 CRITICAL 警示。
+  # 0 = 等你執行 fxea resume(真實資金建議);例如 72 = 冷卻 72 小時後自動以縮減風險恢復(紙上/回測)
+  drawdown_cooldown_hours: 0
+  recovery_risk_scale: 0.5
 
 research:
   provider: rules          # rules | claude(需要 ANTHROPIC_API_KEY)
@@ -81,6 +85,7 @@ monitor:
 account:
   currency: USD
   starting_balance: 10000
+  spread_pips: null        # 紙上交易/回測點差;null = 商品預設(1.0 點),0 = 不計
 
 alerts:
   console: true

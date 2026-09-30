@@ -53,7 +53,7 @@ def build_news(settings: Settings) -> NewsFeed | None:
 
 def build_broker(settings: Settings, state: StateStore, now: datetime, ig_client=None) -> Broker:
     if settings.broker == "paper":
-        return PaperBroker(state, settings.account.starting_balance, settings.account.currency, now)
+        return PaperBroker(state, settings.account.starting_balance, settings.account.currency, now, spread_pips=settings.account.spread_pips)
     if settings.broker == "mt5":
         from .mt5_bridge import MT5Broker
 

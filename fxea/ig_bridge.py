@@ -390,7 +390,7 @@ class IGBroker(Broker):
         self.state.journal({"type": "close", "broker": "ig", "position_id": position_id, "reason": reason, "pnl": pos.pnl})
         return pos
 
-    def mark_to_market(self, prices: dict[str, float], now: datetime) -> list[Position]:
+    def mark_to_market(self, prices: dict[str, float], now: datetime, bars=None) -> list[Position]:
         self._rollover(now)
         live = {p.position_id for p in self.open_positions()}
         closed: list[Position] = []

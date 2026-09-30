@@ -18,6 +18,7 @@ class Instrument(BaseModel):
     lot_min: float = 0.01
     lot_max: float = 100.0
     lot_step: float = 0.01
+    spread_pips: float = 1.0  # 紙上交易 / 回測用的典型點差(來回成本)
 
     def pips(self, distance: float) -> float:
         return abs(distance) / self.pip_size

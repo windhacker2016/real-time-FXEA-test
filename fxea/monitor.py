@@ -2,6 +2,9 @@
 
 外圈四個節點:自選清單更新、觸發警示、狀態監控、主動檢視。
 「系統全天候上線 — 不會停機,沒有開閉市間隔」「監控循環啟用 — 持續監看,隨時待命」
+
+回撤斷路器(:class:`fxea.risk.RiskGovernor`)觸發時,循環不會停:仍然監控部位、
+備忘錄與狀態,只是不開新倉,並且用 CRITICAL 警示與每日提醒告訴你系統正在暫停。
 """
 from __future__ import annotations
 
@@ -16,10 +19,21 @@ from .config import Settings
 from .data.base import MarketDataFeed, NewsFeed
 from .execution.base import Broker
 from .memo import MemoBuilder, render_memo
-from .models import Alert, AlertLevel, CycleReport, Decision, DecisionMemo, MemoStatus, Position
+from .models import (
+    Account,
+    Alert,
+    AlertLevel,
+    Candle,
+    CycleReport,
+    Decision,
+    DecisionMemo,
+    MemoStatus,
+    RiskMode,
+    Timeframe,
+)
 from .planner import TradePlanner
 from .research import Analyst, ResearchContext
-from .risk import RiskModule
+from .risk import RiskGovernor, RiskModule, RiskTransition
 from .scanner import MarketScanner, ScanResult
 from .signals import SignalEngine
 from .state import StateStore
@@ -27,6 +41,7 @@ from .state import StateStore
 log = logging.getLogger("fxea.monitor")
 
 _LIVE_SOURCES = {"mt5", "ig"}
+_SYSTEM_LABEL = {RiskMode.NORMAL: "online", RiskMode.HALTED: "halted", RiskMode.RECOVERY: "recovery"}
 
 
 class MonitorLoop:
@@ -50,6 +65,7 @@ class MonitorLoop:
         self.engine = SignalEngine(settings.signals)
         self.planner = TradePlanner(settings.planner)
         self.risk = RiskModule(settings.risk)
+        self.governor = RiskGovernor(settings.risk, state)
         self.gate = ApprovalGate(state, settings.approval)
         self.memos = MemoBuilder(state)
         self.base_watchlist = [s.upper() for s in settings.watchlist]
@@ -59,6 +75,7 @@ class MonitorLoop:
         self.started_at: datetime | None = None
         self.last_report: CycleReport | None = None
         self._recent_blocks: dict[tuple[str, str], datetime] = {}
+        self._last_halt_reminder: datetime | None = None
 
     # ------------------------------------------------------------------
     def emit(self, level: AlertLevel, title: str, message: str, symbol: str | None = None, report: CycleReport | None = None) -> Alert:
@@ -77,9 +94,9 @@ class MonitorLoop:
         self.watchlist = merged
         return merged
 
-    # ---- 監控:既有部位 / 待審備忘錄 ----------------------------------------
-    def _monitor_positions(self, prices: dict[str, float], now: datetime, report: CycleReport) -> None:
-        for pos in self.broker.mark_to_market(prices, now):
+    # ---- 監控:既有部位 / 回撤斷路器 / 待審備忘錄 ------------------------------
+    def _monitor_positions(self, prices: dict[str, float], bars: dict[str, Candle], now: datetime, report: CycleReport) -> None:
+        for pos in self.broker.mark_to_market(prices, now, bars):
             report.closed.append(pos.position_id)
             level = AlertLevel.WARNING if pos.pnl < 0 else AlertLevel.INFO
             self.emit(level, f"部位平倉:{pos.close_reason}", f"{pos.position_id} {pos.direction.label_zh} {pos.lots} 手 @ {pos.close_price} 損益 {pos.pnl:+.2f}", pos.symbol, report)
@@ -90,6 +107,32 @@ class MonitorLoop:
                     self.state.save_memo(memo)
                 except KeyError:
                     pass
+
+    def _announce_transition(self, t: RiskTransition, report: CycleReport) -> None:
+        cfg = self.settings.risk
+        if t.to_mode is RiskMode.HALTED:
+            hint = f" 冷卻 {cfg.drawdown_cooldown_hours} 小時後自動以縮減風險恢復。" if cfg.drawdown_cooldown_hours > 0 else " 系統不會自行恢復:確認狀況後執行 fxea resume。"
+            self.emit(AlertLevel.CRITICAL, "交易暫停:觸及回撤上限", t.reason + hint, None, report)
+        elif t.to_mode is RiskMode.RECOVERY:
+            self.emit(AlertLevel.WARNING, "恢復交易(縮減風險)", t.reason, None, report)
+        else:
+            self.emit(AlertLevel.INFO, "風險模式恢復正常", t.reason, None, report)
+        self.state.journal({"type": "risk_state", "time": t.time.isoformat(), "from": t.from_mode.value, "to": t.to_mode.value, "reason": t.reason, "by": t.by})
+        if t.to_mode is RiskMode.HALTED:
+            self._last_halt_reminder = t.time
+
+    def _govern(self, now: datetime, report: CycleReport) -> Account:
+        account = self.broker.account()
+        for t in self.governor.update(account, now):
+            self._announce_transition(t, report)
+        st = self.governor.state
+        if st.mode is RiskMode.HALTED and (self._last_halt_reminder is None or now - self._last_halt_reminder >= timedelta(hours=24)):
+            self._last_halt_reminder = now
+            since = f"{st.halted_at:%Y-%m-%d %H:%M}" if st.halted_at else "?"
+            cfg = self.settings.risk
+            how = f"冷卻 {cfg.drawdown_cooldown_hours} 小時後自動恢復" if cfg.drawdown_cooldown_hours > 0 else "執行 fxea resume 恢復"
+            self.emit(AlertLevel.WARNING, "交易暫停中(回撤斷路器)", f"自 {since} 起未開新倉。{st.halt_reason};{how}", None, report)
+        return account
 
     def _monitor_memos(self, prices: dict[str, float], now: datetime, report: CycleReport) -> None:
         for memo in self.gate.expire_stale(now):
@@ -107,6 +150,10 @@ class MonitorLoop:
     # ---- 執行已核准 --------------------------------------------------------
     def _execute_approved(self, prices: dict[str, float], now: datetime, report: CycleReport) -> None:
         for memo in self.gate.approved_unexecuted():
+            if self.governor.halted:
+                self.gate.expire(memo, "交易暫停中(回撤斷路器),未執行", now)
+                self.emit(AlertLevel.WARNING, "交易暫停中,已核准備忘錄未執行", f"{memo.memo_id};恢復交易後需重新產生設定", memo.symbol, report)
+                continue
             price = prices.get(memo.symbol)
             if price is None:
                 try:
@@ -151,7 +198,16 @@ class MonitorLoop:
         plan = self.planner.build(signals[0], snapshot, res.candles)
         account = self.broker.account()
         open_positions = self.broker.open_positions()
-        risk = self.risk.evaluate(plan, snapshot, account, open_positions, now)
+        risk = self.risk.evaluate(
+            plan,
+            snapshot,
+            account,
+            open_positions,
+            now,
+            risk_scale=self.governor.risk_scale,
+            drawdown_pct=self.governor.drawdown_pct(account.equity),
+            mode=self.governor.mode,
+        )
 
         # 同商品、同樣的阻擋原因在冷卻期內只記錄一次(避免洗版,也省下研究層呼叫)
         if not (risk.passed and plan.valid):
@@ -189,8 +245,11 @@ class MonitorLoop:
     def _status(self, now: datetime, report: CycleReport, announce: bool) -> None:
         account = self.broker.account()
         open_positions = self.broker.open_positions()
+        st = self.governor.state
+        dd = self.governor.drawdown_pct(account.equity)
         report.equity = account.equity
-        report.drawdown_pct = round(account.drawdown_pct, 3)
+        report.drawdown_pct = round(dd, 3)
+        report.risk_mode = st.mode
         report.open_positions = len(open_positions)
         report.pending_memos = len(self.gate.pending())
         uptime = (now - self.started_at) if self.started_at else timedelta(0)
@@ -202,18 +261,24 @@ class MonitorLoop:
             "equity": account.equity,
             "balance": account.balance,
             "drawdown_pct": report.drawdown_pct,
+            "reference_peak": st.reference_peak,
+            "all_time_peak": account.peak_equity,
             "daily_pnl": account.daily_pnl,
+            "risk_mode": st.mode.value,
+            "halt_reason": st.halt_reason if st.mode is RiskMode.HALTED else None,
+            "halted_at": st.halted_at.isoformat() if st.halted_at else None,
+            "halts": st.halts,
             "open_positions": [p.model_dump(mode="json") for p in open_positions],
             "pending_memos": [m.memo_id for m in self.gate.pending()],
             "scanner_errors": self.scanner.errors,
-            "system": "online",
+            "system": _SYSTEM_LABEL[st.mode],
         }
         self.state.save_status(status)
         if announce:
             self.emit(
                 AlertLevel.INFO,
                 "狀態監控",
-                f"第 {self.cycle} 輪 | 權益 {account.equity:.2f} | 回撤 {account.drawdown_pct:.2f}% | 今日 {account.daily_pnl:+.2f} | 未平倉 {len(open_positions)} | 待審 {report.pending_memos} | 系統運作正常",
+                f"第 {self.cycle} 輪 | 權益 {account.equity:.2f} | 回撤 {dd:.2f}% | 今日 {account.daily_pnl:+.2f} | 未平倉 {len(open_positions)} | 待審 {report.pending_memos} | 風險模式 {st.mode.label_zh}",
                 None,
                 report,
             )
@@ -238,6 +303,19 @@ class MonitorLoop:
                 self.emit(AlertLevel.INFO, "主動檢視:備忘錄等待審核", f"{memo.memo_id} 已等待 {age_min:.0f} 分鐘", memo.symbol, report)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _latest_bars(results: list[ScanResult]) -> dict[str, Candle]:
+        bars: dict[str, Candle] = {}
+        for r in results:
+            df = r.candles.get(Timeframe.H1)
+            if df is None or df.empty:
+                continue
+            row = df.iloc[-1]
+            t = row["time"]
+            t = t.to_pydatetime() if hasattr(t, "to_pydatetime") else t
+            bars[r.snapshot.symbol] = Candle(time=t, open=float(row["open"]), high=float(row["high"]), low=float(row["low"]), close=float(row["close"]), volume=float(row["volume"]))
+        return bars
+
     def run_cycle(self) -> CycleReport:
         self.cycle += 1
         now = self.feed.now()
@@ -252,27 +330,30 @@ class MonitorLoop:
         report.scanned = len(results)
         report.opportunities = sum(1 for r in results if r.snapshot.opportunity)
         prices = {r.snapshot.symbol: r.snapshot.price for r in results}
+        bars = self._latest_bars(results)
         for sym, err in self.scanner.errors.items():
             self.emit(AlertLevel.WARNING, "掃描失敗", err, sym, report)
 
-        # 3 監控既有部位與備忘錄(用最新價)
-        self._monitor_positions(prices, now, report)
+        # 3 監控既有部位(用最新 K 棒高低點)→ 回撤斷路器 → 備忘錄
+        self._monitor_positions(prices, bars, now, report)
+        self._govern(now, report)
         self._monitor_memos(prices, now, report)
-        # 4 執行已核准
+        # 4 執行已核准(暫停中會拒絕並失效)
         self._execute_approved(prices, now, report)
 
-        # 5 訊號 → 風險 → 研究 → 備忘錄
-        busy = self.gate.active_symbols()
-        if not self.settings.risk.allow_same_symbol:
-            busy |= {p.symbol for p in self.broker.open_positions()}
-        for res in results:
-            if not res.snapshot.opportunity or res.snapshot.symbol in busy:
-                continue
-            memo = self._process_opportunity(res, now, report)
-            if memo is not None:
-                busy.add(res.snapshot.symbol)
-        # 自動核准模式:同一輪就執行
-        self._execute_approved(prices, now, report)
+        # 5 訊號 → 風險 → 研究 → 備忘錄(暫停中不開新設定)
+        if not self.governor.halted:
+            busy = self.gate.active_symbols()
+            if not self.settings.risk.allow_same_symbol:
+                busy |= {p.symbol for p in self.broker.open_positions()}
+            for res in results:
+                if not res.snapshot.opportunity or res.snapshot.symbol in busy:
+                    continue
+                memo = self._process_opportunity(res, now, report)
+                if memo is not None:
+                    busy.add(res.snapshot.symbol)
+            # 自動核准模式:同一輪就執行
+            self._execute_approved(prices, now, report)
 
         # 6 狀態監控 / 7 主動檢視
         self._status(now, report, announce=(self.cycle % self.settings.monitor.status_every == 0))
@@ -288,7 +369,12 @@ class MonitorLoop:
     def run(self, cycles: int | None = None, interval: float | None = None, sleep: Callable[[float], None] = time.sleep) -> list[CycleReport]:
         interval = self.settings.monitor.interval_seconds if interval is None else interval
         reports: list[CycleReport] = []
-        self.emit(AlertLevel.INFO, "系統全天候上線", f"監控循環啟用:{', '.join(self.watchlist)} | 來源 {self.settings.data_source} | 券商 {self.broker.name} | 研究 {getattr(self.analyst, 'name', '?')} | 核准 {self.settings.approval.mode}")
+        mode = self.governor.mode
+        self.emit(
+            AlertLevel.INFO,
+            "系統全天候上線",
+            f"監控循環啟用:{', '.join(self.watchlist)} | 來源 {self.settings.data_source} | 券商 {self.broker.name} | 研究 {getattr(self.analyst, 'name', '?')} | 核准 {self.settings.approval.mode} | 風險模式 {mode.label_zh}",
+        )
         while cycles is None or len(reports) < cycles:
             try:
                 reports.append(self.run_cycle())

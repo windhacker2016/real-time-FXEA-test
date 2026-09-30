@@ -215,7 +215,7 @@ class MT5Broker(Broker):
         self._save_meta()
         return pos
 
-    def mark_to_market(self, prices: dict[str, float], now: datetime) -> list[Position]:
+    def mark_to_market(self, prices: dict[str, float], now: datetime, bars=None) -> list[Position]:
         self._rollover(now)
         live = {p.position_id for p in self.open_positions()}
         closed = []

@@ -3,7 +3,7 @@ import json
 from fxea.alerts import MemoryAlertSink
 from fxea.app import build_loop
 from fxea.config import load_settings
-from fxea.models import Decision, MemoStatus
+from fxea.models import AlertLevel, Decision, MemoStatus
 
 
 def _settings(tmp_path, **over):
@@ -46,8 +46,29 @@ def test_auto_mode_end_to_end(tmp_path):
         assert len(m.risk.checks) == 5 and m.research.rationale
 
 
+def test_drawdown_breaker_halts_loudly_and_resumes(tmp_path):
+    sink = MemoryAlertSink()
+    loop = build_loop(_settings(tmp_path, risk={"max_drawdown_pct": 0.0, "drawdown_cooldown_hours": 0}), alerts=sink)
+    loop.run(cycles=20, interval=0)
+    assert loop.governor.halted
+    crit = [a for a in sink.alerts if a.level is AlertLevel.CRITICAL]
+    assert len(crit) == 1 and crit[0].title.startswith("交易暫停") and "fxea resume" in crit[0].message
+    assert loop.state.list_memos() == []  # 暫停中不產生新設定,也不洗版
+    status = json.loads((tmp_path / "state" / "status.json").read_text())
+    assert status["system"] == "halted" and status["risk_mode"] == "halted" and status["halt_reason"]
+    assert (tmp_path / "state" / "risk_state.json").exists()
+
+    # 人工恢復(先把上限調回合理值)後,設定重新產生
+    loop.settings.risk.max_drawdown_pct = 50.0
+    loop.governor.resume(loop.feed.now(), by="tester")
+    loop.run(cycles=60, interval=0)
+    assert not loop.governor.halted
+    assert loop.state.list_memos()
+    assert json.loads((tmp_path / "state" / "status.json").read_text())["system"] == "online"
+
+
 def test_block_cooldown_suppresses_repeats(tmp_path):
-    loop = build_loop(_settings(tmp_path, risk={"max_drawdown_pct": 0.0}), alerts=MemoryAlertSink())
+    loop = build_loop(_settings(tmp_path, risk={"volatility_percentile_band": [200, 300]}), alerts=MemoryAlertSink())
     loop.run(cycles=30, interval=0)
     memos = loop.state.list_memos()
     assert memos and all(m.status is MemoStatus.BLOCKED for m in memos)

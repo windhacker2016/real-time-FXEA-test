@@ -1,8 +1,12 @@
 # FXEA — 用 FABLE 5 打造全天候 AI 交易員
 
-研究、訊號、風險管理,全天候持續運作。這個專案依照 8 張概念圖的架構實作一套
+研究、訊號、風險管理,全天候持續運作。這個專案依照 7 張概念圖的架構實作一套
 **Python 外匯交易系統**:市場掃描 → 訊號引擎 → 交易計畫 → 風險模組 → 全天候監控循環 →
 最終決策備忘錄,**最後由你做決定**(核准 / 觀察清單 / 拒絕)。
+
+> 這是一套**交易流程與風控框架**,不是一個已驗證有優勢的策略。內建的訊號規則是教科書式的
+> 通用啟發法,預設參數沒有針對任何商品最佳化;請先用 `fxea backtest` 與模擬帳戶驗證,
+> 再決定要不要、以及怎麼用它。
 
 ```
         ┌──────────┐    ┌──────────┐
@@ -34,14 +38,16 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 52 個離線測試
+python -m pytest -q                       # 60 個離線測試
 
 # 合成行情 + 紙上交易,跑 40 輪(每輪 = 1 根 H1)
 python -m fxea.cli run --cycles 40 --interval 0
 python -m fxea.cli pending                 # 看等待你審核的備忘錄
 python -m fxea.cli decide FD-001-0101 approve   # 或 watchlist / reject
-python -m fxea.cli status
+python -m fxea.cli status                  # 帳戶、部位、待審、風險模式
 python -m fxea.cli scan                    # 只掃描一次,列出快照與訊號
+python -m fxea.cli resume                  # 回撤斷路器暫停後,人工恢復交易
+python -m fxea.cli backtest --csv-dir data --from 2026-01-01   # 用歷史 CSV 回測
 ```
 
 `pip install -e .` 之後可直接用 `fxea run` 等指令。
@@ -82,14 +88,54 @@ python -m fxea.cli scan                    # 只掃描一次,列出快照與訊�
 
 1. **自選清單更新** — 設定的清單 + 有部位 / 有待審備忘錄的商品
 2. **掃描** — 每個商品產生 `MarketSnapshot`
-3. **監控** — 紙上交易檢查停損/停利;待審與觀察清單備忘錄檢查失效條件、進場區條件、逾時
-4. **執行** — 已核准且未執行的備忘錄下單(價格離開進場區 > 1 ATR 或已失效則不執行並告知)
-5. **訊號 → 計畫 → 風險 → 研究 → 備忘錄** — 每個有機會的商品最多一份進行中的備忘錄
+3. **監控** — 紙上交易用最新 K 棒高低點檢查停損/停利;回撤斷路器更新狀態;
+   待審與觀察清單備忘錄檢查失效條件、進場區條件、逾時
+4. **執行** — 已核准且未執行的備忘錄下單(價格離開進場區 > 1 ATR、已失效、或交易暫停中則不執行並告知)
+5. **訊號 → 計畫 → 風險 → 研究 → 備忘錄** — 每個有機會的商品最多一份進行中的備忘錄;暫停中不產生
 6. **狀態監控** — `state/status.json`;每 N 輪發一則摘要警示
 7. **主動檢視** — 獲利 ≥ 1R、部位停滯、備忘錄久候 → 提醒
 
 警示輸出到主控台、`state/alerts.jsonl`,也可設 `alerts.webhook_url`(POST JSON)。
 所有事件寫入 `state/journal.jsonl`,備忘錄在 `state/memos/*.json`。
+
+## 回撤斷路器
+
+權益從高水位回落 ≥ `risk.max_drawdown_pct` → 進入**暫停**:不開新倉、已核准未執行的備忘錄失效、
+發一則 CRITICAL 警示,之後每 24 小時提醒一次;`fxea status` 顯示 `halted`。循環本身不停,仍然監控既有部位。
+
+恢復方式:
+
+- `drawdown_cooldown_hours: 0`(預設,真實資金建議):等你執行 `fxea resume`。預設進入**恢復期**——
+  回撤從目前權益重新起算、每筆風險 × `recovery_risk_scale`(0.5),權益回到暫停前高點才回復全額;
+  `fxea resume --full-risk` 直接回復全額。
+- `drawdown_cooldown_hours: 72`(紙上交易 / 回測建議):冷卻期滿自動進入恢復期。
+
+為什麼需要它:沒有這個狀態機,回撤檢查失敗後沒有部位 → 權益不變 → 永遠通不過檢查,
+系統會**安靜地停止交易**且不會自行恢復——這正是第一版回測暴露的問題。
+
+## 回測(`fxea backtest`)
+
+```bash
+# 1. 在裝有 MT5 的 Windows 匯出 H1 歷史(time,open,high,low,close,volume)
+python scripts/export_mt5_csv.py EURUSD 2025-11-15 data/
+# 2. 回測:--from 之前的資料只當指標暖機,正式從 2026-01-01 起算
+python -m fxea.cli backtest --csv-dir data --symbol EURUSD --from 2026-01-01 --cooldown-hours 72
+```
+
+輸出 `backtests/<時間戳>/trades.csv`、`equity.csv` 與統計:勝率(± 標準誤)、損益兩平勝率、
+平均獲利/虧損、賠率、每筆期望值、獲利因子、最大回撤(高點/低點日期)、斷路器觸發次數、
+最長無交易間隔、以及一行「優勢」判讀。
+
+回測衡量的是**機械規則本身**(掃描 → 訊號 → 計畫 → 風險 → 斷路器),以規則式研究 + 自動核准執行,
+不含 Claude 研究層與人工篩選。保真度:進出場計點差、停損/停利用 K 棒高低點(同棒觸及兩者先算停損)、
+訊號只在收盤後產生;沒有滑價與隔夜利息。
+
+怎麼讀結果:
+
+- **勝率要和「損益兩平勝率」比**,不是和 50% 比。賠率 2:1 時損益兩平約 33%。
+- **差距小於 2 個標準誤就當作沒有優勢**。64 筆交易的勝率標準誤約 ±6 個百分點;要有底氣說「有優勢」,
+  通常需要幾百筆交易加上樣本外驗證。
+- 調整參數後,一定用**沒有參與調參的期間**再跑一次。
 
 ## 即時模式:IG 帳戶
 
@@ -159,9 +205,10 @@ research:
 | `scanner` | 成交量門檻、變動 % 門檻、關鍵價位距離、新聞視窗 |
 | `signals` | `min_score`(預設 60)、每商品最多幾個訊號 |
 | `planner` | 最低 R:R(2.0)、ATR 停損倍數、進場區半寬、失效距離 |
-| `risk` | 每筆風險 1%、總曝險 5%、最多 4 筆、回撤 10%、日虧損 3%、ATR 百分位 5–95、新聞禁區 30 分 |
+| `risk` | 每筆風險 1%、總曝險 5%、最多 4 筆、回撤 10%、日虧損 3%、ATR 百分位 5–95、新聞禁區 30 分、斷路器冷卻/恢復期風險 |
 | `approval` | `human`(預設)/ `auto`(僅紙上交易);待審逾時 240 分 |
 | `monitor` | 循環間隔、狀態/主動檢視頻率、阻擋冷卻期 |
+| `account` | 紙上交易起始資金、點差(`spread_pips`,null = 商品預設 1 點) |
 
 風險模組的「最大虧損」以**最壞情況**計算:今日已實現虧損 + 所有未平倉部位同時停損 + 本筆。
 
@@ -179,13 +226,16 @@ fxea/
   models.py       所有資料模型(對應每張圖的節點)
   scanner.py      圖 2   signals.py   圖 3   planner.py  圖 4   risk.py  圖 5
   research.py     圖 1   monitor.py   圖 6   memo.py / approval.py  圖 7
+  risk.py         也含 RiskGovernor(回撤斷路器狀態機)
+  backtest.py     CSV 回放回測與統計
   indicators.py   EMA / ATR / RSI / 擺盪高低點 / K 線型態
-  instruments.py  點值、手數、合約規格
+  instruments.py  點值、手數、合約規格、點差
   data/           synthetic / csv / 新聞
-  execution/      Broker 介面、PaperBroker
+  execution/      Broker 介面、PaperBroker(點差、盤中觸價)
   mt5_bridge.py   MT5 行情 + 券商      ig_bridge.py  IG REST 行情 + 券商
   alerts.py  state.py  app.py  cli.py
-tests/            52 個離線測試(含假 IG 伺服器、假 Claude 客戶端)
+scripts/export_mt5_csv.py   從 MT5 匯出 H1 歷史 CSV
+tests/            60 個離線測試(含假 IG 伺服器、假 Claude 客戶端)
 config/default.yaml
 ```
 
