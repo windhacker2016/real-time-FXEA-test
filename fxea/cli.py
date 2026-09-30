@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .app import build_loop
 from .approval import ApprovalGate
-from .config import Settings, load_settings
+from .config import Settings, _deep_merge, load_settings, parse_set_args
 from .memo import render_memo
 from .models import Decision
 from .risk import RiskGovernor
@@ -30,13 +30,16 @@ def _settings(args: argparse.Namespace) -> Settings:
     path = args.config
     if path is None and Path("config/default.yaml").exists():
         path = "config/default.yaml"
-    overrides = {}
+    overrides: dict = {}
     if getattr(args, "state_dir", None):
         overrides["state_dir"] = args.state_dir
     if getattr(args, "auto", False):
         overrides["approval"] = {"mode": "auto"}
+    if getattr(args, "honor_research", False):
+        overrides["approval"] = {**overrides.get("approval", {}), "honor_research": True}
     if getattr(args, "research", None):
         overrides["research"] = {"provider": args.research}
+    overrides = _deep_merge(overrides, parse_set_args(getattr(args, "set", None)))
     return load_settings(path, overrides)
 
 
@@ -143,14 +146,30 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
-    from .backtest import format_report, parse_date, run_backtest
+    from .backtest import format_comparison, format_report, parse_date, run_backtest, run_by_type
 
     settings = _settings(args)
     symbols = args.symbol or settings.watchlist
     start = parse_date(args.start) if args.start else None
     out = args.out or f"backtests/{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
-    result = run_backtest(settings, args.csv_dir, symbols, start, out, cooldown_hours=args.cooldown_hours, warmup=args.warmup)
-    print(format_report(result))
+    overrides: dict = {}
+    if args.research == "claude":
+        # 用 AI 層回測:採納研究建議,且不允許悄悄退回規則式
+        overrides["research"] = {"provider": "claude"}
+        overrides["approval"] = {"honor_research": True}
+    try:
+        common = dict(cooldown_hours=args.cooldown_hours, warmup=args.warmup, overrides=overrides)
+        if args.by_type:
+            results = run_by_type(settings, args.csv_dir, symbols, start, out, **common)
+            for r in results:
+                print(format_report(r))
+                print()
+            print(format_comparison(results))
+        else:
+            print(format_report(run_backtest(settings, args.csv_dir, symbols, start, out, **common)))
+    except RuntimeError as exc:
+        print(f"回測中止:{exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -158,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fxea", description="全天候 AI 外匯交易員")
     p.add_argument("--config", help="YAML 設定檔(預設 config/default.yaml)")
     p.add_argument("--state-dir", dest="state_dir", help="覆寫狀態目錄")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE", help="覆寫任一設定,例如 --set signals.min_score=70 --set scanner.trading_hours_utc=[7,17]")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -165,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cycles", type=int, default=None, help="執行輪數(預設無限)")
     r.add_argument("--interval", type=float, default=None, help="每輪間隔秒數(覆寫設定)")
     r.add_argument("--auto", action="store_true", help="自動核准(僅建議紙上交易)")
+    r.add_argument("--honor-research", dest="honor_research", action="store_true", help="auto 模式採納研究建議(execute/watch/skip)")
     r.add_argument("--research", choices=["rules", "claude"], help="覆寫研究分析器")
     r.set_defaults(func=cmd_run)
 
@@ -200,6 +221,9 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--out", help="輸出資料夾(預設 backtests/<時間戳>)")
     bt.add_argument("--cooldown-hours", type=int, default=72, help="回撤斷路器冷卻小時數(預設 72;0 = 觸發後不再交易)")
     bt.add_argument("--warmup", type=int, default=300, help="指標暖機至少幾根 H1")
+    bt.add_argument("--research", choices=["rules", "claude"], default="rules", help="claude:每個候選設定交給 Claude 判斷並採納(花 API 費用)")
+    bt.add_argument("--honor-research", dest="honor_research", action="store_true", help="rules 模式也採納規則式研究建議")
+    bt.add_argument("--by-type", dest="by_type", action="store_true", help="基準 + 五種訊號型態各跑一次,印比較表")
     bt.set_defaults(func=cmd_backtest)
     return p
 

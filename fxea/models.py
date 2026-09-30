@@ -222,6 +222,7 @@ class MarketSnapshot(BaseModel):
     rsi_h1: float
     levels: KeyLevels
     upcoming_news: list[NewsEvent] = Field(default_factory=list)
+    in_session: bool = True  # 是否在設定的交易時段內
     opportunity: bool = False  # 偵測到交易機會
     notes: list[str] = Field(default_factory=list)
 
@@ -329,10 +330,20 @@ class AnalystOutput(BaseModel):
     recommendation: Literal["execute", "watch", "skip"]  # 執行 / 觀察 / 略過
     rationale: str
     concerns: list[str] = Field(default_factory=list)
+    # ---- AI 交易員層:超越機械規則的判斷(全部有界限,由程式驗證後才採用)----
+    risk_fraction: float = 1.0  # 信念部位:0.25–1.0 倍的每筆風險
+    suggested_entry: Optional[float] = None  # 距機械進場價 ≤ max_entry_shift_atr × ATR 才採用
+    suggested_stop_loss: Optional[float] = None  # 距進場 min_stop_atr–max_stop_atr × ATR 才採用
+    suggested_take_profit: Optional[float] = None  # 調整後 R:R 仍 ≥ min_risk_reward 才採用
+    key_observations: list[str] = Field(default_factory=list)  # 從 K 棒/結構看到、規則沒抓到的事
 
 
 class ResearchAssessment(AnalystOutput):
     source: str = "rules"  # "rules" 或 "claude:<model>"
+    applied_adjustments: list[str] = Field(default_factory=list)  # 實際被採用的 AI 調整
+    ignored_suggestions: list[str] = Field(default_factory=list)  # 超出界限、未採用的建議
+    tokens_in: int = 0
+    tokens_out: int = 0
 
     @property
     def stars(self) -> str:
@@ -368,10 +379,20 @@ class DecisionMemo(BaseModel):
     executed: bool = False
     position_id: Optional[str] = None
     note: Optional[str] = None
+    # 交易結果(部位平倉後回填;AI 會看到同商品近期的戰績)
+    outcome_pnl: Optional[float] = None
+    outcome_reason: Optional[str] = None
+    closed_at: Optional[datetime] = None
 
     @property
     def primary_signal(self) -> Signal:
         return self.signals[0]
+
+    @property
+    def r_multiple(self) -> Optional[float]:
+        if self.outcome_pnl is None or self.risk.risk_amount <= 0:
+            return None
+        return round(self.outcome_pnl / self.risk.risk_amount, 2)
 
     @property
     def awaiting_human(self) -> bool:

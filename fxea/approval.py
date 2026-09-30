@@ -1,7 +1,8 @@
 """圖 7 下半部:需要人工審核 → 核准(執行交易)/ 觀察清單(監控條件)/ 拒絕(不要交易)。
 
 ``approval.mode = human``(預設)時,備忘錄寫入待審佇列,等待 ``fxea decide``;
-``auto`` 只建議用於紙上交易 / 回放。
+``auto`` 只建議用於紙上交易 / 回放。``auto`` + ``honor_research`` 時採納研究層建議:
+execute → 核准、watch → 觀察清單(價格回到進場區才核准,逾時失效)、skip → 拒絕。
 """
 from __future__ import annotations
 
@@ -27,11 +28,18 @@ class ApprovalGate:
     def submit(self, memo: DecisionMemo, now: datetime | None = None) -> DecisionMemo:
         now = now or utcnow()
         if self.cfg.mode == "auto" and memo.status is MemoStatus.READY:
-            memo.decision = Decision.APPROVE
-            memo.decided_by = "auto"
+            rec = memo.research.recommendation if self.cfg.honor_research else "execute"
+            if rec == "execute":
+                memo.decision, memo.decided_by = Decision.APPROVE, "auto"
+            elif rec == "watch":
+                memo.decision, memo.decided_by = Decision.WATCHLIST, "auto:research"
+                memo.note = "研究建議觀察:價格回到進場區再執行"
+            else:
+                memo.decision, memo.decided_by = Decision.REJECT, "auto:research"
+                memo.note = "研究建議略過"
             memo.decided_at = now
         self.store.save_memo(memo)
-        self.store.journal({"type": "memo", "memo_id": memo.memo_id, "symbol": memo.symbol, "status": memo.status.value, "decision": memo.decision.value})
+        self.store.journal({"type": "memo", "memo_id": memo.memo_id, "symbol": memo.symbol, "status": memo.status.value, "decision": memo.decision.value, "research": memo.research.recommendation})
         return memo
 
     def decide(
@@ -91,10 +99,14 @@ class ApprovalGate:
         return memo
 
     def expire_stale(self, now: datetime | None = None) -> list[DecisionMemo]:
+        """待審逾時失效;自動模式下的觀察清單(研究建議 watch)也有同樣時限。"""
         now = now or utcnow()
         ttl = timedelta(minutes=self.cfg.pending_ttl_minutes)
         expired = []
         for memo in self.pending():
             if now - memo.created_at > ttl:
                 expired.append(self.expire(memo, f"超過 {self.cfg.pending_ttl_minutes} 分鐘未審核,自動失效", now))
+        for memo in self.watchlist():
+            if (memo.decided_by or "").startswith("auto") and now - (memo.decided_at or memo.created_at) > ttl:
+                expired.append(self.expire(memo, f"觀察 {self.cfg.pending_ttl_minutes} 分鐘未回到進場區,自動失效", now))
         return expired

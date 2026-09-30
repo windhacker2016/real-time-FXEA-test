@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,18 +29,42 @@ class StateStore:
         return data[key]
 
     # ---- 備忘錄 --------------------------------------------------------
+    # 監控循環每輪會列舉備忘錄十幾次;以 (路徑, mtime) 快取避免重複解析幾百個 JSON,
+    # 目錄本身最多每秒重掃一次(即時模式每輪 ≥ 1 秒,仍看得到 `fxea decide` 從別的程序寫入的變更)
+    _RESCAN_SECONDS = 1.0
+
+    def _cache(self) -> dict[str, tuple[float, DecisionMemo]]:
+        return self.__dict__.setdefault("_memo_cache", {})
+
+    def _cached(self, path: Path) -> DecisionMemo:
+        cache = self._cache()
+        mtime = path.stat().st_mtime
+        hit = cache.get(path.name)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        memo = DecisionMemo.model_validate_json(path.read_text(encoding="utf-8"))
+        cache[path.name] = (mtime, memo)
+        return memo
+
     def save_memo(self, memo: DecisionMemo) -> None:
-        (self.memo_dir / f"{memo.memo_id}.json").write_text(memo.model_dump_json(indent=2), encoding="utf-8")
+        path = self.memo_dir / f"{memo.memo_id}.json"
+        path.write_text(memo.model_dump_json(indent=2), encoding="utf-8")
+        self._cache()[path.name] = (path.stat().st_mtime, memo)
 
     def load_memo(self, memo_id: str) -> DecisionMemo:
         path = self.memo_dir / f"{memo_id}.json"
         if not path.exists():
             raise KeyError(f"找不到備忘錄 {memo_id}")
-        return DecisionMemo.model_validate_json(path.read_text(encoding="utf-8"))
+        return self._cached(path).model_copy(deep=True)
 
     def list_memos(self) -> list[DecisionMemo]:
-        memos = [DecisionMemo.model_validate_json(p.read_text(encoding="utf-8")) for p in self.memo_dir.glob("*.json")]
-        return sorted(memos, key=lambda m: m.created_at)
+        now = time.monotonic()
+        stamp = self.__dict__.get("_memo_scan_stamp")
+        if stamp is None or now - stamp > self._RESCAN_SECONDS:
+            for p in self.memo_dir.glob("*.json"):
+                self._cached(p)
+            self.__dict__["_memo_scan_stamp"] = now
+        return sorted((m for _, m in self._cache().values()), key=lambda m: m.created_at)
 
     # ---- 帳戶 / 部位 ---------------------------------------------------
     def save_account(self, account: Account) -> None:

@@ -66,12 +66,15 @@ def build_broker(settings: Settings, state: StateStore, now: datetime, ig_client
     raise ValueError(f"未知的 broker:{settings.broker}")
 
 
-def build_analyst(settings: Settings, client=None) -> Analyst:
+def build_analyst(settings: Settings, client=None, strict: bool = False) -> Analyst:
+    """``strict=True``:無法建立 Claude 分析器就拋出(回測用),不悄悄退回規則式。"""
     cfg = settings.research
     if cfg.provider == "claude":
         try:
-            return ClaudeAnalyst(cfg, client=client)
+            return ClaudeAnalyst(cfg, client=client, strict=strict)
         except Exception as exc:  # noqa: BLE001 - 無金鑰等情況退回規則式
+            if strict:
+                raise RuntimeError(f"無法建立 Claude 分析器:{exc}") from exc
             log.warning("無法建立 Claude 分析器(%s),改用規則式分析", exc)
     return RuleBasedAnalyst()
 

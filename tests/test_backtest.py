@@ -55,3 +55,44 @@ def test_backtest_cli_end_to_end(tmp_path, capsys):
     assert len(trades) >= 2  # 標題 + 至少一筆
     equity = (out / "equity.csv").read_text().splitlines()
     assert equity[1].startswith(start)  # 權益曲線從正式起算日開始,之前只當暖機
+    assert "研究層:" in text and "機械規則" in text
+
+
+def test_backtest_by_type_and_set_overrides(tmp_path, capsys):
+    feed = SyntheticFeed(["EURUSD"], seed=11, bars=650)
+    df = feed.candles("EURUSD", Timeframe.H1, 650)
+    data = tmp_path / "data"
+    data.mkdir()
+    df.to_csv(data / "EURUSD_H1.csv", index=False)
+    start = df["time"].iloc[330].strftime("%Y-%m-%d")
+
+    rc = main(["--set", "signals.min_score=55", "backtest", "--csv-dir", str(data), "--symbol", "EURUSD", "--from", start, "--out", str(tmp_path / "bt"), "--by-type"])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "各訊號型態單獨回測" in text and "全部(基準)" in text
+    for label in ("突破", "拉回", "動能", "趨勢延續", "反轉"):
+        assert label in text
+    assert (tmp_path / "bt" / "all" / "trades.csv").exists() and (tmp_path / "bt" / "breakout" / "trades.csv").exists()
+
+    # --set 真的生效:把門檻拉到 100 就不會有任何交易
+    rc = main(["--set", "signals.min_score=100", "backtest", "--csv-dir", str(data), "--from", start, "--out", str(tmp_path / "bt2")])
+    assert rc == 0 and "交易筆數:0" in capsys.readouterr().out
+
+
+def test_backtest_claude_api_failure_aborts_instead_of_silently_using_rules(tmp_path, capsys, monkeypatch):
+    # 假金鑰 + 指到本機不可達的埠:連線立刻被拒 → strict 模式必須中止回測,而不是悄悄退回規則式
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-real")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    feed = SyntheticFeed(["EURUSD"], seed=11, bars=650)
+    data = tmp_path / "data"
+    data.mkdir()
+    feed.candles("EURUSD", Timeframe.H1, 650).to_csv(data / "EURUSD_H1.csv", index=False)
+    rc = main(
+        ["--set", "research.max_retries=0", "--set", "research.timeout_seconds=2", "--set", "signals.min_score=55",
+         "backtest", "--csv-dir", str(data), "--out", str(tmp_path / "bt"), "--research", "claude"]
+    )
+    assert rc == 1
+    assert "回測中止" in capsys.readouterr().err

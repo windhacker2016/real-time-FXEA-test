@@ -41,9 +41,11 @@ def test_auto_mode_end_to_end(tmp_path):
     assert (tmp_path / "state" / "journal.jsonl").exists()
     status = json.loads((tmp_path / "state" / "status.json").read_text())
     assert status["system"] == "online" and status["cycle"] == 80
-    # 每份 memo 都有五項風險檢查與研究結果
+    # 每份 memo 都有五項風險檢查與研究結果;平倉後戰績回填
     for m in memos:
         assert len(m.risk.checks) == 5 and m.research.rationale
+    closed = [m for m in memos if m.outcome_pnl is not None]
+    assert closed and all(m.outcome_reason in ("停損", "停利") and m.closed_at is not None for m in closed)
 
 
 def test_drawdown_breaker_halts_loudly_and_resumes(tmp_path):

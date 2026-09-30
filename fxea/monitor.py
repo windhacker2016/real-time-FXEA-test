@@ -31,8 +31,8 @@ from .models import (
     RiskMode,
     Timeframe,
 )
-from .planner import TradePlanner
-from .research import Analyst, ResearchContext
+from .planner import TradePlanner, apply_research_adjustments
+from .research import Analyst, ResearchContext, RuleBasedAnalyst
 from .risk import RiskGovernor, RiskModule, RiskTransition
 from .scanner import MarketScanner, ScanResult
 from .signals import SignalEngine
@@ -59,6 +59,7 @@ class MonitorLoop:
         self.feed = feed
         self.broker = broker
         self.analyst = analyst
+        self.rules_analyst = RuleBasedAnalyst()  # 被風險阻擋的設定不花 AI 呼叫
         self.alerts = alerts
         self.state = state
         self.scanner = MarketScanner(feed, settings.scanner, news)
@@ -76,6 +77,7 @@ class MonitorLoop:
         self.last_report: CycleReport | None = None
         self._recent_blocks: dict[tuple[str, str], datetime] = {}
         self._last_halt_reminder: datetime | None = None
+        self._last_memo_at: dict[str, datetime] = {}
 
     # ------------------------------------------------------------------
     def emit(self, level: AlertLevel, title: str, message: str, symbol: str | None = None, report: CycleReport | None = None) -> Alert:
@@ -104,6 +106,9 @@ class MonitorLoop:
                 try:
                     memo = self.state.load_memo(pos.memo_id)
                     memo.note = f"部位 {pos.position_id} 已平倉:{pos.close_reason},損益 {pos.pnl:+.2f}"
+                    memo.outcome_pnl = pos.pnl
+                    memo.outcome_reason = pos.close_reason
+                    memo.closed_at = pos.closed_at or now
                     self.state.save_memo(memo)
                 except KeyError:
                     pass
@@ -145,7 +150,12 @@ class MonitorLoop:
                 self.gate.expire(memo, f"失效條件觸發:價格 {price} 已越過 {memo.plan.invalidation_level}", now)
                 self.emit(AlertLevel.WARNING, "交易設定失效", f"{memo.memo_id} 價格 {price} 突破失效價位 {memo.plan.invalidation_level}", memo.symbol, report)
             elif memo.decision is Decision.WATCHLIST and memo.plan.price_in_entry_zone(price):
-                self.emit(AlertLevel.WARNING, "觀察清單條件達成", f"{memo.memo_id} 價格 {price} 進入進場區 {memo.plan.entry_zone_low}–{memo.plan.entry_zone_high},可執行 fxea decide {memo.memo_id} approve", memo.symbol, report)
+                zone = f"{memo.plan.entry_zone_low}–{memo.plan.entry_zone_high}"
+                if self.settings.approval.mode == "auto":
+                    self.gate.decide(memo.memo_id, Decision.APPROVE, by="auto:zone", now=now)
+                    self.emit(AlertLevel.WARNING, "觀察清單條件達成,自動核准", f"{memo.memo_id} 價格 {price} 進入進場區 {zone}", memo.symbol, report)
+                else:
+                    self.emit(AlertLevel.WARNING, "觀察清單條件達成", f"{memo.memo_id} 價格 {price} 進入進場區 {zone},可執行 fxea decide {memo.memo_id} approve", memo.symbol, report)
 
     # ---- 執行已核准 --------------------------------------------------------
     def _execute_approved(self, prices: dict[str, float], now: datetime, report: CycleReport) -> None:
@@ -189,6 +199,29 @@ class MonitorLoop:
             )
 
     # ---- 訊號 → 計畫 → 風險 → 研究 → 備忘錄 -----------------------------------
+    def _recent_trades(self, symbol: str, n: int) -> list[dict]:
+        """同商品近期已平倉交易(給 AI 看它自己的戰績)。"""
+        if n <= 0:
+            return []
+        done = [m for m in self.state.list_memos() if m.symbol == symbol and m.outcome_pnl is not None]
+        done.sort(key=lambda m: m.closed_at or m.created_at, reverse=True)
+        return [
+            {
+                "memo_id": m.memo_id,
+                "opened": m.created_at.isoformat(),
+                "closed": m.closed_at.isoformat() if m.closed_at else None,
+                "signal": m.primary_signal.signal_type.value,
+                "timeframe": m.primary_signal.timeframe.value,
+                "direction": m.plan.direction.value,
+                "score": m.primary_signal.score,
+                "research": m.research.recommendation,
+                "pnl": m.outcome_pnl,
+                "r_multiple": m.r_multiple,
+                "reason": m.outcome_reason,
+            }
+            for m in done[:n]
+        ]
+
     def _process_opportunity(self, res: ScanResult, now: datetime, report: CycleReport) -> DecisionMemo | None:
         snapshot = res.snapshot
         signals = self.engine.detect(snapshot, res.candles)
@@ -198,19 +231,13 @@ class MonitorLoop:
         plan = self.planner.build(signals[0], snapshot, res.candles)
         account = self.broker.account()
         open_positions = self.broker.open_positions()
-        risk = self.risk.evaluate(
-            plan,
-            snapshot,
-            account,
-            open_positions,
-            now,
-            risk_scale=self.governor.risk_scale,
-            drawdown_pct=self.governor.drawdown_pct(account.equity),
-            mode=self.governor.mode,
-        )
+        base_scale = self.governor.risk_scale
+        dd = self.governor.drawdown_pct(account.equity)
+        risk = self.risk.evaluate(plan, snapshot, account, open_positions, now, risk_scale=base_scale, drawdown_pct=dd, mode=self.governor.mode)
+        eligible = risk.passed and plan.valid
 
         # 同商品、同樣的阻擋原因在冷卻期內只記錄一次(避免洗版,也省下研究層呼叫)
-        if not (risk.passed and plan.valid):
+        if not eligible:
             failed = ",".join(c.name for c in risk.checks if not c.passed) or "plan_invalid"
             key = (snapshot.symbol, failed)
             last = self._recent_blocks.get(key)
@@ -219,20 +246,55 @@ class MonitorLoop:
                 return None
             self._recent_blocks[key] = now
 
-        research = self.analyst.assess(ResearchContext(snapshot, signals, plan, risk, open_positions))
+        # 研究層:通過風險檢查的設定交給 AI;被阻擋的用規則式(省錢)
+        rcfg = self.settings.research
+        analyst = self.analyst if (eligible or not rcfg.only_when_ready) else self.rules_analyst
+        ctx = ResearchContext(
+            snapshot,
+            signals,
+            plan,
+            risk,
+            open_positions,
+            candles=res.candles,
+            recent_trades=self._recent_trades(snapshot.symbol, rcfg.recent_trades),
+            now=now,
+        )
+        research = analyst.assess(ctx)
+
+        # AI 交易員層:界限內調整計畫、信念部位 → 風險模組重新驗算
+        if eligible:
+            adjusted, applied, ignored = apply_research_adjustments(plan, research, self.settings.planner)
+            research.applied_adjustments = applied
+            research.ignored_suggestions = ignored
+            fraction = research.risk_fraction
+            if applied or fraction != 1.0:
+                plan = adjusted
+                risk = self.risk.evaluate(plan, snapshot, account, open_positions, now, risk_scale=base_scale * fraction, drawdown_pct=dd, mode=self.governor.mode)
+
         memo = self.memos.build(snapshot, signals, plan, risk, research, now)
         memo = self.gate.submit(memo, now)
+        self._last_memo_at[snapshot.symbol] = now
 
         sig = signals[0]
         if memo.status is MemoStatus.READY:
             report.memos_created.append(memo.memo_id)
-            how = "自動核准,將執行" if memo.decision is Decision.APPROVE else "需要人工核准"
+            how = {
+                Decision.APPROVE: "自動核准,將執行",
+                Decision.WATCHLIST: "研究建議觀察 → 觀察清單",
+                Decision.REJECT: "研究建議略過 → 已拒絕",
+                Decision.PENDING: "需要人工核准",
+            }[memo.decision]
+            extras = ""
+            if research.applied_adjustments:
+                extras += " AI 調整:" + ";".join(research.applied_adjustments)
+            if research.risk_fraction != 1.0:
+                extras += f" 信念部位 ×{research.risk_fraction:g}"
             self.emit(
                 AlertLevel.WARNING,
                 f"交易計畫完成 — {how}",
                 f"{memo.memo_id} {sig.signal_type.label_zh} {plan.direction.label_zh} 評分 {sig.score:.0f} "
                 f"進場 {plan.entry_price} 停損 {plan.stop_loss} 停利 {plan.take_profit} R:R 1:{plan.risk_reward:.2f} "
-                f"信心 {research.stars} 研究建議:{research.recommendation_zh}",
+                f"信心 {research.stars} 研究建議:{research.recommendation_zh}{extras}",
                 snapshot.symbol,
                 report,
             )
@@ -346,12 +408,17 @@ class MonitorLoop:
             busy = self.gate.active_symbols()
             if not self.settings.risk.allow_same_symbol:
                 busy |= {p.symbol for p in self.broker.open_positions()}
+            window = timedelta(minutes=self.settings.monitor.min_minutes_between_memos)
             for res in results:
-                if not res.snapshot.opportunity or res.snapshot.symbol in busy:
+                sym = res.snapshot.symbol
+                if not res.snapshot.opportunity or sym in busy:
+                    continue
+                last = self._last_memo_at.get(sym)
+                if last is not None and now - last < window:
                     continue
                 memo = self._process_opportunity(res, now, report)
                 if memo is not None:
-                    busy.add(res.snapshot.symbol)
+                    busy.add(sym)
             # 自動核准模式:同一輪就執行
             self._execute_approved(prices, now, report)
 
@@ -366,7 +433,14 @@ class MonitorLoop:
             self.feed.advance()
         return report
 
-    def run(self, cycles: int | None = None, interval: float | None = None, sleep: Callable[[float], None] = time.sleep) -> list[CycleReport]:
+    def run(
+        self,
+        cycles: int | None = None,
+        interval: float | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        fail_fast: bool = False,
+    ) -> list[CycleReport]:
+        """``fail_fast=True``(回測用):任何一輪出錯直接拋出,而不是記錄後繼續。"""
         interval = self.settings.monitor.interval_seconds if interval is None else interval
         reports: list[CycleReport] = []
         mode = self.governor.mode
@@ -375,19 +449,25 @@ class MonitorLoop:
             "系統全天候上線",
             f"監控循環啟用:{', '.join(self.watchlist)} | 來源 {self.settings.data_source} | 券商 {self.broker.name} | 研究 {getattr(self.analyst, 'name', '?')} | 核准 {self.settings.approval.mode} | 風險模式 {mode.label_zh}",
         )
-        while cycles is None or len(reports) < cycles:
+        attempts = 0  # 以「嘗試次數」計數:失敗的一輪也算,否則持續出錯會無限迴圈
+        while cycles is None or attempts < cycles:
+            attempts += 1
             try:
                 reports.append(self.run_cycle())
             except KeyboardInterrupt:
                 self.emit(AlertLevel.WARNING, "人工中止", "監控循環停止")
                 break
             except Exception as exc:  # 單輪失敗不能讓全天候系統停機
+                if fail_fast:
+                    raise
                 log.exception("監控循環第 %s 輪失敗", self.cycle)
                 self.emit(AlertLevel.CRITICAL, "循環錯誤", f"第 {self.cycle} 輪:{exc}")
+                if self.replay:
+                    self.feed.advance()  # 回放來源仍要前進,否則同一根 K 棒一直重跑
             if getattr(self.feed, "exhausted", False):
                 self.emit(AlertLevel.INFO, "回放結束", "資料已用盡")
                 break
-            if interval > 0 and (cycles is None or len(reports) < cycles):
+            if interval > 0 and (cycles is None or attempts < cycles):
                 sleep(interval)
         return reports
 

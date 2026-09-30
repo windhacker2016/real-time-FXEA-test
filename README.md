@@ -38,7 +38,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 60 個離線測試
+python -m pytest -q                       # 76 個離線測試
 
 # 合成行情 + 紙上交易,跑 40 輪(每輪 = 1 根 H1)
 python -m fxea.cli run --cycles 40 --interval 0
@@ -48,6 +48,9 @@ python -m fxea.cli status                  # 帳戶、部位、待審、風險�
 python -m fxea.cli scan                    # 只掃描一次,列出快照與訊號
 python -m fxea.cli resume                  # 回撤斷路器暫停後,人工恢復交易
 python -m fxea.cli backtest --csv-dir data --from 2026-01-01   # 用歷史 CSV 回測
+python -m fxea.cli backtest --csv-dir data --from 2026-01-01 --by-type          # 五種訊號各自回測
+python -m fxea.cli backtest --csv-dir data --from 2026-01-01 --research claude  # AI 交易員層回測(花 API 費用)
+python -m fxea.cli --set scanner.trading_hours_utc=[7,17] backtest --csv-dir data --from 2026-01-01  # 任一設定都能臨時覆寫
 ```
 
 `pip install -e .` 之後可直接用 `fxea run` 等指令。
@@ -181,33 +184,89 @@ IG REST 有歷史價格配額(約每週 10,000 點),`IGFeed` 會快取並只增�
 > 兩個橋接皆依官方文件撰寫、以假伺服器做單元測試,但**尚未在本開發環境(Linux)對真實
 > IG 帳戶實測**。上線前務必先用模擬帳戶 + `approval.mode: human` 跑幾天。
 
-## 研究層:Claude(FABLE 5)
+## 超越機械規則:AI 交易員層(Claude / FABLE 5)
+
+機械規則負責「找候選」;AI 負責「像交易員一樣判斷」。三個原則:**AI 看得到完整的盤、AI 的判斷有牙齒、
+AI 的價值可以被回測驗證**。
+
+**AI 看得到什麼**(每個通過風險檢查的候選設定):最近 60 根 H1 + 40 根 H4 K 棒(CSV)、兩個週期的
+EMA/RSI/ATR、關鍵價位、新聞、訊號引擎的訊號與理由、機械交易計畫、風險模組五項檢查、未平倉部位、
+以及**同商品近期由本系統執行的交易與結果**(它自己的戰績,含 R 倍數)。
+
+**AI 能決定什麼**(全部有界限,程式驗證後才採用):
+
+| 決定 | 機制 | 界限 |
+|---|---|---|
+| `execute` / `watch` / `skip` | `approval.honor_research: true` 時,auto 模式採納:執行 → 核准;觀察 → 觀察清單,價格回到進場區才核准,逾時失效;略過 → 拒絕。human 模式則顯示在備忘錄供你參考 | — |
+| 信念部位 `risk_fraction` | 每筆風險 × 0.25–1.0,風險模組重算手數 | 夾在 0.25–1.0 |
+| 調整進場 / 停損 / 目標 | `apply_research_adjustments`:採用後失效價位、進場區、R:R 全部重算,風險模組重新驗算 | 進場位移 ≤ 1 ATR;停損距進場 0.5–3 ATR;調整後 R:R ≥ 最低要求;幾何不成立整組退回 |
+| `key_observations` | 寫進備忘錄:它從 K 棒看到、規則沒抓到的事 | — |
 
 ```yaml
 research:
   provider: claude          # 需要 ANTHROPIC_API_KEY(或 ant auth login)
-  model: claude-fable-5-1   # 也可 claude-fable-5 / claude-opus-5-5
+  model: claude-fable-5-1   # 也可 claude-fable-5 / claude-opus-5-5 / claude-sonnet-5-5
   effort: high
   fallbacks: true           # 伺服器端拒答備援
+  candles_h1: 60
+  candles_h4: 40
+  recent_trades: 10
+  allow_plan_adjustment: true
+  allow_conviction_sizing: true
+  only_when_ready: true     # 被風險阻擋的設定不花 AI 呼叫
+approval:
+  honor_research: true      # auto 模式採納 AI 建議(human 模式仍由你決定)
 ```
 
-- 使用官方 `anthropic` SDK 的 `beta.messages.parse`,以 `AnalystOutput` 為結構化輸出 schema。
-- Fable 5.x 思考永遠開啟,程式不傳 `thinking`,深度以 `output_config.effort` 控制。
-- 認證失敗 / 速率限制 / 連線錯誤 / 模型拒答 → 自動退回 `RuleBasedAnalyst`,並在備忘錄的
-  疑慮欄註明。**Claude 只評估,不下單**;下單永遠要過風險模組與你的核准。
-- 系統提示放在快取前綴(`cache_control`),同一天多次呼叫可省輸入成本。
+**怎麼驗證 AI 有沒有價值**:同一份歷史資料跑兩次——`fxea backtest ...`(機械規則)與
+`fxea backtest ... --research claude`(AI 層),比較樣本外的期望值、獲利因子與最大回撤。回測結束會印
+Claude 呼叫次數、token 用量與估計費用(每個候選設定約 4K 輸入 token,Fable 5.1 約 0.05–0.07 美元;
+Opus 5.5 約 0.03 美元)。`--research claude` 在 API 失敗時會**中止回測**而不是悄悄退回規則式。
+
+**即時模式的成本控制**:`monitor.min_minutes_between_memos`(預設 60)限制同商品兩份備忘錄的最短間隔,
+所以 AI 呼叫頻率約等於「每根 H1 最多一次 × 商品數」,不會跟著 60 秒的監控循環走。
+
+實作細節:官方 `anthropic` SDK 的 `beta.messages.parse`,以 `AnalystOutput` 為結構化輸出 schema;
+Fable 5.x 思考永遠開啟,程式不傳 `thinking`,深度以 `output_config.effort` 控制;系統提示放在快取前綴。
+即時模式下認證失敗 / 速率限制 / 連線錯誤 / 模型拒答 → 退回 `RuleBasedAnalyst` 並在備忘錄疑慮欄註明。
+**Claude 只評估,不下單**;下單永遠要過風險模組與核准閘門。
+
+### 老實說 AI 層能不能贏
+
+不知道,所以才做成可以回測的。LLM 擅長綜合脈絡(結構、新聞、自己的戰績)與紀律,不是預言機;
+如果 `--research claude` 在樣本外沒有贏過機械規則,那就是它在這個商品、這個週期沒有加值,
+不要因為它是 AI 就相信它。下一步的候選:給 AI 看圖(用 matplotlib 把 K 棒畫成圖,連同 CSV 一起餵)、
+接即時財經日曆取代靜態新聞檔、即時模式加網路搜尋工具(不可回測,只能紙上驗證)。
+
+## 實驗開關
+
+找優勢的三個便宜實驗(都不是曲線擬合),用 `--set` 臨時覆寫或寫進 YAML:
+
+```bash
+# 1. 五種訊號型態各自回測,看損益到底來自哪一種
+python -m fxea.cli backtest --csv-dir data --from 2026-01-01 --by-type
+# 2. 只做與 H4 趨勢同向的設定(both = H1 與 H4 都同向)
+python -m fxea.cli --set signals.require_trend_alignment=h4 backtest --csv-dir data --from 2026-01-01
+# 3. EURUSD 只做倫敦/紐約時段(UTC 小時,含起不含迄)
+python -m fxea.cli --set scanner.trading_hours_utc=[7,17] backtest --csv-dir data --from 2026-01-01
+# 也可以只留特定型態
+python -m fxea.cli --set signals.enabled_types=[pullback,trend_continuation] backtest --csv-dir data --from 2026-01-01
+```
+
+判斷標準不變:樣本外、幾百筆、z > 2;每個實驗的樣本數都比全部更少,差距更容易只是雜訊。
 
 ## 設定重點(`config/default.yaml`)
 
 | 區塊 | 用途 |
 |---|---|
 | `watchlist` | 主攻 `EURUSD`;可再加 `GBPUSD`、`USDJPY`… |
-| `scanner` | 成交量門檻、變動 % 門檻、關鍵價位距離、新聞視窗 |
-| `signals` | `min_score`(預設 60)、每商品最多幾個訊號 |
-| `planner` | 最低 R:R(2.0)、ATR 停損倍數、進場區半寬、失效距離 |
+| `scanner` | 成交量門檻、變動 % 門檻、關鍵價位距離、新聞視窗、交易時段 `trading_hours_utc` |
+| `signals` | `min_score`(預設 60)、每商品最多幾個訊號、`enabled_types`、`require_trend_alignment` |
+| `planner` | 最低 R:R(2.0)、ATR 停損倍數、進場區半寬、失效距離、AI 調整界限 |
+| `research` | 分析器(rules / claude)、模型、effort、AI 看幾根 K 棒、允許哪些 AI 決定 |
 | `risk` | 每筆風險 1%、總曝險 5%、最多 4 筆、回撤 10%、日虧損 3%、ATR 百分位 5–95、新聞禁區 30 分、斷路器冷卻/恢復期風險 |
-| `approval` | `human`(預設)/ `auto`(僅紙上交易);待審逾時 240 分 |
-| `monitor` | 循環間隔、狀態/主動檢視頻率、阻擋冷卻期 |
+| `approval` | `human`(預設)/ `auto`(僅紙上交易);待審逾時 240 分;`honor_research` |
+| `monitor` | 循環間隔、狀態/主動檢視頻率、阻擋冷卻期、同商品備忘錄最短間隔 |
 | `account` | 紙上交易起始資金、點差(`spread_pips`,null = 商品預設 1 點) |
 
 風險模組的「最大虧損」以**最壞情況**計算:今日已實現虧損 + 所有未平倉部位同時停損 + 本筆。
@@ -235,7 +294,7 @@ fxea/
   mt5_bridge.py   MT5 行情 + 券商      ig_bridge.py  IG REST 行情 + 券商
   alerts.py  state.py  app.py  cli.py
 scripts/export_mt5_csv.py   從 MT5 匯出 H1 歷史 CSV
-tests/            60 個離線測試(含假 IG 伺服器、假 Claude 客戶端)
+tests/            76 個離線測試(含假 IG 伺服器、假 Claude 客戶端)
 config/default.yaml
 ```
 

@@ -92,8 +92,12 @@ class MarketScanner:
         for e in news:
             notes.append(f"新聞:{e.time:%m/%d %H:%M} {e.currency} {e.title}(影響:{e.impact})")
 
-        opportunity = points >= 2
-        if opportunity:
+        in_session = self.in_session(now)
+        opportunity = points >= 2 and in_session
+        if not in_session:
+            lo, hi = cfg.trading_hours_utc or (0, 24)
+            notes.append(f"時段外:{now:%H:%M} UTC 不在交易時段 {lo:02d}–{hi:02d}(部位照常監控)")
+        elif opportunity:
             notes.append("偵測到交易機會")
 
         snapshot = MarketSnapshot(
@@ -110,10 +114,22 @@ class MarketScanner:
             rsi_h1=round(rsi_h1, 1),
             levels=levels,
             upcoming_news=news,
+            in_session=in_session,
             opportunity=opportunity,
             notes=notes,
         )
         return ScanResult(snapshot=snapshot, candles={Timeframe.H1: h1, Timeframe.H4: h4})
+
+    def in_session(self, now) -> bool:
+        """交易時段檢查(UTC 小時,含起不含迄,支援跨日)。"""
+        hours = self.cfg.trading_hours_utc
+        if hours is None:
+            return True
+        lo, hi = hours
+        h = now.hour
+        if lo <= hi:
+            return lo <= h < hi
+        return h >= lo or h < hi
 
     def scan_all(self, symbols: list[str]) -> list[ScanResult]:
         out: list[ScanResult] = []

@@ -1,7 +1,9 @@
-"""回測:CSV 回放 + 紙上交易 + 自動核准 + 規則式研究 → 交易明細、權益曲線、統計。
+"""回測:CSV 回放 + 紙上交易 + 自動核准 → 交易明細、權益曲線、統計。
 
-回測衡量的是**機械規則本身**(掃描 → 訊號 → 計畫 → 風險 → 斷路器),
-不含 Claude 研究層與人工篩選;結果是這套流程「底線」的表現,不是上限。
+兩種模式:
+- ``research=rules``(預設):衡量機械規則本身(掃描 → 訊號 → 計畫 → 風險 → 斷路器)。
+- ``research=claude``:每個通過風險檢查的候選設定都交給 Claude 判斷(execute/watch/skip、
+  信念部位、界限內調整),並採納其建議。會花 API 費用;結束時印出 token 用量與估計費用。
 
 保真度:進出場計入點差、停損/停利用 K 棒高低點判斷(同棒觸及兩者先算停損)、
 只在 K 棒收盤後產生訊號並於下一根起算。沒有滑價與隔夜利息。
@@ -12,15 +14,18 @@ import csv
 import json
 import math
 import shutil
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .app import build_loop
+from .app import build_analyst, build_loop
 from .config import Settings, _deep_merge
 from .data.csv_feed import CsvFeed
-from .models import Position
+from .memo import _pad
+from .models import MemoStatus, Position, SignalType
+from .research import Analyst
 
 
 @dataclass
@@ -29,7 +34,9 @@ class BacktestResult:
     equity: list[tuple[datetime, float]]
     stats: dict[str, Any]
     halts: list[dict[str, Any]] = field(default_factory=list)
+    research: dict[str, Any] = field(default_factory=dict)
     out_dir: Path | None = None
+    label: str = ""
 
 
 def run_backtest(
@@ -40,6 +47,9 @@ def run_backtest(
     out_dir: str | Path,
     cooldown_hours: int | None = 72,
     warmup: int = 300,
+    overrides: dict[str, Any] | None = None,
+    analyst: Analyst | None = None,
+    label: str = "",
 ) -> BacktestResult:
     out = Path(out_dir)
     state_dir = out / "state"
@@ -47,23 +57,27 @@ def run_backtest(
         shutil.rmtree(state_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    overrides: dict[str, Any] = {
+    base: dict[str, Any] = {
         "data_source": "csv",
         "csv_dir": str(csv_dir),
         "broker": "paper",
         "watchlist": [s.upper() for s in symbols],
         "state_dir": str(state_dir),
         "approval": {"mode": "auto"},
-        "research": {"provider": "rules"},
         "alerts": {"console": False, "file": None, "webhook_url": None},
     }
     if cooldown_hours is not None:
-        overrides["risk"] = {"drawdown_cooldown_hours": cooldown_hours}
-    bt_settings = Settings.model_validate(_deep_merge(settings.model_dump(), overrides))
+        base["risk"] = {"drawdown_cooldown_hours": cooldown_hours}
+    merged = _deep_merge(_deep_merge(settings.model_dump(), base), overrides or {})
+    bt_settings = Settings.model_validate(merged)
+
+    if analyst is None:
+        # 回測不允許悄悄退回規則式:要 Claude 就必須真的用 Claude
+        analyst = build_analyst(bt_settings, strict=True)
 
     feed = CsvFeed(csv_dir, bt_settings.watchlist, warmup=warmup, warmup_until=start)
-    loop = build_loop(bt_settings, feed=feed)
-    loop.run(cycles=None, interval=0)
+    loop = build_loop(bt_settings, feed=feed, analyst=analyst)
+    loop.run(cycles=None, interval=0, fail_fast=True)
 
     trades = [p for p in loop.broker.all_positions() if p.status == "closed" and (start is None or p.opened_at >= start)]  # type: ignore[attr-defined]
 
@@ -82,11 +96,46 @@ def run_backtest(
                 halts.append(ev)
 
     stats = compute_stats(trades, equity, halts)
+    research = _research_summary(loop.state.list_memos(), analyst, bt_settings)
     _write_csvs(out, trades, equity)
-    return BacktestResult(trades=trades, equity=equity, stats=stats, halts=halts, out_dir=out)
+    return BacktestResult(trades=trades, equity=equity, stats=stats, halts=halts, research=research, out_dir=out, label=label)
+
+
+def run_by_type(settings: Settings, csv_dir, symbols, start, out_dir, **kwargs) -> list[BacktestResult]:
+    """基準(五種全開)+ 每種訊號型態單獨一次,看損益到底來自哪裡。"""
+    out = Path(out_dir)
+    results = [run_backtest(settings, csv_dir, symbols, start, out / "all", label="全部(基準)", **kwargs)]
+    for st in SignalType:
+        ov = _deep_merge(kwargs.get("overrides") or {}, {"signals": {"enabled_types": [st.value]}})
+        kw = {**kwargs, "overrides": ov}
+        results.append(run_backtest(settings, csv_dir, symbols, start, out / st.value, label=st.label_zh, **kw))
+    return results
 
 
 # ---------------------------------------------------------------------------
+
+
+def _research_summary(memos, analyst: Analyst | None, settings: Settings) -> dict[str, Any]:
+    considered = [m for m in memos if m.status is not MemoStatus.BLOCKED]
+    recs = Counter(m.research.recommendation for m in considered)
+    sources = Counter(m.research.source.split(":")[0] for m in considered)
+    adjusted = sum(1 for m in considered if m.research.applied_adjustments)
+    sized_down = sum(1 for m in considered if m.research.risk_fraction < 1.0)
+    out: dict[str, Any] = {
+        "provider": settings.research.provider,
+        "model": settings.research.model if settings.research.provider == "claude" else None,
+        "candidates": len(considered),
+        "recommendations": dict(recs),
+        "sources": dict(sources),
+        "adjusted_plans": adjusted,
+        "sized_down": sized_down,
+    }
+    if analyst is not None and hasattr(analyst, "usage"):
+        out["calls"] = getattr(analyst, "calls", 0)
+        out["fallbacks_used"] = getattr(analyst, "fallbacks_used", 0)
+        out["usage"] = dict(analyst.usage)  # type: ignore[attr-defined]
+        out["estimated_cost_usd"] = getattr(analyst, "estimated_cost_usd", None)
+    return out
 
 
 def compute_stats(trades: list[Position], equity: list[tuple[datetime, float]], halts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -182,9 +231,26 @@ def _fmt_t(t: datetime | None) -> str:
     return t.strftime("%Y-%m-%d") if t else "-"
 
 
+def edge_line(s: dict[str, Any]) -> str | None:
+    if not s["trades"] or s["breakeven_win_rate"] is None:
+        return None
+    edge = (s["win_rate"] - s["breakeven_win_rate"]) * 100
+    z = edge / (s["win_rate_stderr"] * 100) if s["win_rate_stderr"] > 0 else 0.0
+    verdict = "統計上無法與零優勢區分" if abs(z) < 2 else ("優勢顯著" if z > 0 else "劣勢顯著")
+    return f"優勢:勝率高於損益兩平 {edge:+.1f} 個百分點(z ≈ {z:.1f},{verdict};樣本 {s['trades']} 筆)"
+
+
 def format_report(result: BacktestResult) -> str:
     s = result.stats
-    L = ["═══ 回測結果(機械規則,不含 Claude 研究層與人工篩選)═══"]
+    r = result.research
+    title = "═══ 回測結果"
+    if r.get("provider") == "claude":
+        title += f"(AI 交易員層:{r.get('model')})═══"
+    else:
+        title += "(機械規則,不含 Claude 研究層與人工篩選)═══"
+    L = [title]
+    if result.label:
+        L.append(f"設定:{result.label}")
     if result.equity:
         L.append(f"期間:{_fmt_t(result.equity[0][0])} → {_fmt_t(result.equity[-1][0])}({s['span_days']:.0f} 天)")
     L.append(f"交易筆數:{s['trades']}(約 {s['trades_per_month']:.1f} 筆/月)  停損 {s['stop_outs']} / 停利 {s['take_profits']}")
@@ -200,13 +266,46 @@ def format_report(result: BacktestResult) -> str:
         L.append(f"  {sym}:{int(d['trades'])} 筆,勝 {int(d['wins'])},損益 {d['pnl']:+.2f}")
     for h in result.halts:
         L.append(f"  ⏸ {h.get('time', '')[:16]} {h.get('reason', '')}")
-    if s["trades"] and s["breakeven_win_rate"] is not None:
-        edge = (s["win_rate"] - s["breakeven_win_rate"]) * 100
-        z = edge / (s["win_rate_stderr"] * 100) if s["win_rate_stderr"] > 0 else 0.0
-        verdict = "統計上無法與零優勢區分" if abs(z) < 2 else ("優勢顯著" if z > 0 else "劣勢顯著")
-        L.append(f"優勢:勝率高於損益兩平 {edge:+.1f} 個百分點(z ≈ {z:.1f},{verdict};樣本 {s['trades']} 筆)")
+    if r:
+        recs = r.get("recommendations", {})
+        L.append(
+            f"研究層:{r.get('candidates', 0)} 個候選設定 → 執行 {recs.get('execute', 0)} / 觀察 {recs.get('watch', 0)} / 略過 {recs.get('skip', 0)};"
+            f"調整計畫 {r.get('adjusted_plans', 0)} 次,縮小部位 {r.get('sized_down', 0)} 次"
+        )
+        if "calls" in r:
+            u = r.get("usage", {})
+            cost = r.get("estimated_cost_usd")
+            cost_txt = f"約 ${cost:.2f}" if cost is not None else "未知價格"
+            L.append(
+                f"Claude 呼叫 {r['calls']} 次(退回規則式 {r.get('fallbacks_used', 0)} 次);token 輸入 {u.get('input_tokens', 0):,} / 快取讀取 {u.get('cache_read_input_tokens', 0):,} / 輸出 {u.get('output_tokens', 0):,};估計費用 {cost_txt}"
+            )
+    edge = edge_line(s)
+    if edge:
+        L.append(edge)
     if result.out_dir:
         L.append(f"明細:{result.out_dir / 'trades.csv'}  權益曲線:{result.out_dir / 'equity.csv'}")
+    return "\n".join(L)
+
+
+def format_comparison(results: list[BacktestResult]) -> str:
+    header = _pad("設定", 14) + _pad("筆數", 6) + _pad("勝率", 8) + _pad("兩平", 8) + _pad("期望值", 10) + _pad("獲利因子", 10) + _pad("淨損益", 12) + _pad("最大回撤", 10) + "斷路器"
+    L = ["═══ 各訊號型態單獨回測 ═══", header, "─" * 90]
+    for r in results:
+        s = r.stats
+        be = f"{s['breakeven_win_rate'] * 100:.1f}%" if s.get("breakeven_win_rate") is not None else "-"
+        pf = f"{s['profit_factor']:.2f}" if math.isfinite(s["profit_factor"]) else "∞"
+        L.append(
+            _pad(r.label, 14)
+            + _pad(str(s["trades"]), 6)
+            + _pad(f"{s['win_rate'] * 100:.1f}%" if s["trades"] else "-", 8)
+            + _pad(be, 8)
+            + _pad(f"{s['expectancy']:+.1f}" if s["trades"] else "-", 10)
+            + _pad(pf if s["trades"] else "-", 10)
+            + _pad(f"{s['net_pnl']:+.1f}", 12)
+            + _pad(f"{s['max_drawdown_pct']:.1f}%", 10)
+            + str(s["halts"])
+        )
+    L.append("(勝率要和「兩平」比;筆數少於 100 的列,差距基本上是雜訊)")
     return "\n".join(L)
 
 

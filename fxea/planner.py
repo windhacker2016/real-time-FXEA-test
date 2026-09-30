@@ -11,8 +11,15 @@ import pandas as pd
 
 from .config import PlannerConfig
 from .indicators import atr, swing_levels
-from .instruments import get_instrument
-from .models import Confidence, Direction, MarketSnapshot, Signal, SignalType, Timeframe, TradePlan
+from .instruments import Instrument, get_instrument
+from .models import AnalystOutput, Confidence, Direction, MarketSnapshot, Signal, SignalType, Timeframe, TradePlan
+
+
+def _invalidation_text(tf: Timeframe, d: Direction, level: float) -> str:
+    return (
+        f"{tf.value} 收盤{'跌破' if d is Direction.LONG else '突破'} {level}"
+        f"(結構{'低' if d is Direction.LONG else '高'}點之外)則此設定失效"
+    )
 
 
 class TradePlanner:
@@ -80,10 +87,7 @@ class TradePlanner:
 
         # ---- 失效條件 ----------------------------------------------------
         invalidation = stop - sgn * cfg.invalidation_atr * a
-        cond = (
-            f"{signal.timeframe.value} 收盤{'跌破' if d is Direction.LONG else '突破'} "
-            f"{inst.round_price(invalidation)}(結構{'低' if d is Direction.LONG else '高'}點之外)則此設定失效"
-        )
+        cond = _invalidation_text(signal.timeframe, d, inst.round_price(invalidation))
 
         # ---- 信心 --------------------------------------------------------
         if signal.score >= 80:
@@ -118,3 +122,78 @@ class TradePlanner:
             valid=valid,
             invalid_reason=reason,
         )
+
+
+def apply_research_adjustments(plan: TradePlan, research: AnalystOutput, cfg: PlannerConfig) -> tuple[TradePlan, list[str], list[str]]:
+    """把 AI 建議的價位套用到計畫上——**只在界限內採用**,回傳 (新計畫, 已採用, 未採用)。
+
+    界限:進場距機械進場價 ≤ max_entry_shift_atr × ATR;停損距進場在 min_stop_atr–max_stop_atr × ATR;
+    目標須讓 R:R ≥ min_risk_reward。任何一項越界就不採用該項;調整後幾何不成立則整組退回。
+    """
+    inst: Instrument = get_instrument(plan.symbol)
+    a = plan.atr if plan.atr > 0 else inst.pip_size * 10
+    sgn = plan.direction.sign
+    entry, stop, target = plan.entry_price, plan.stop_loss, plan.take_profit
+    applied: list[str] = []
+    ignored: list[str] = []
+
+    if research.suggested_entry is not None:
+        e = inst.round_price(research.suggested_entry)
+        if abs(e - plan.entry_price) <= cfg.max_entry_shift_atr * a:
+            if e != entry:
+                applied.append(f"進場 {entry} → {e}")
+            entry = e
+        else:
+            ignored.append(f"進場 {e} 距機械進場價超過 {cfg.max_entry_shift_atr:g} ATR")
+
+    if research.suggested_stop_loss is not None:
+        s = inst.round_price(research.suggested_stop_loss)
+        dist = (entry - s) * sgn
+        if cfg.min_stop_atr * a <= dist <= cfg.max_stop_atr * a:
+            if s != stop:
+                applied.append(f"停損 {stop} → {s}")
+            stop = s
+        else:
+            ignored.append(f"停損 {s} 距進場 {dist / a:.2f} ATR,超出 {cfg.min_stop_atr:g}–{cfg.max_stop_atr:g} ATR")
+
+    stop_dist = (entry - stop) * sgn
+    if research.suggested_take_profit is not None:
+        t = inst.round_price(research.suggested_take_profit)
+        reward = (t - entry) * sgn
+        if stop_dist > 0 and reward > 0 and reward / stop_dist >= cfg.min_risk_reward:
+            if t != target:
+                applied.append(f"目標 {target} → {t}")
+            target = t
+        else:
+            rr_txt = f"{reward / stop_dist:.2f}" if stop_dist > 0 else "n/a"
+            ignored.append(f"目標 {t} 的 R:R 1:{rr_txt} 低於 1:{cfg.min_risk_reward:g}")
+
+    if not applied:
+        return plan, [], ignored
+
+    # 最終幾何驗證:任何一項不成立就整組退回機械計畫
+    stop_dist = (entry - stop) * sgn
+    reward = (target - entry) * sgn
+    if stop_dist <= 0 or reward <= 0 or stop_dist < cfg.min_stop_atr * a or stop_dist > cfg.max_stop_atr * a:
+        return plan, [], ignored + ["調整後停損/目標幾何不成立,整組不採用"]
+    rr = reward / stop_dist
+    if rr < cfg.min_risk_reward:
+        return plan, [], ignored + [f"調整後 R:R 1:{rr:.2f} 低於 1:{cfg.min_risk_reward:g},整組不採用"]
+
+    invalidation = inst.round_price(stop - sgn * cfg.invalidation_atr * a)
+    new = plan.model_copy(
+        update=dict(
+            entry_price=entry,
+            entry_zone_low=inst.round_price(entry - cfg.entry_zone_atr * a),
+            entry_zone_high=inst.round_price(entry + cfg.entry_zone_atr * a),
+            stop_loss=stop,
+            take_profit=target,
+            invalidation_level=invalidation,
+            invalidation_condition=_invalidation_text(plan.timeframe, plan.direction, invalidation),
+            risk_reward=round(rr, 2),
+            rationale=plan.rationale + [f"AI 調整:{x}" for x in applied],
+            valid=True,
+            invalid_reason=None,
+        )
+    )
+    return new, applied, ignored

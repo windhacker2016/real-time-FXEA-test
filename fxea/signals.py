@@ -81,6 +81,14 @@ class SignalEngine:
                 best[key] = s
         ranked = sorted(best.values(), key=lambda s: s.score, reverse=True)
         ranked = [s for s in ranked if s.score >= self.cfg.min_score]
+        # 實驗開關:只留特定型態 / 只留順勢
+        if self.cfg.enabled_types is not None:
+            allowed = set(self.cfg.enabled_types)
+            ranked = [s for s in ranked if s.signal_type in allowed]
+        if self.cfg.require_trend_alignment == "h4":
+            ranked = [s for s in ranked if snapshot.trend_h4.matches(s.direction)]
+        elif self.cfg.require_trend_alignment == "both":
+            ranked = [s for s in ranked if snapshot.trend_h4.matches(s.direction) and snapshot.trend_h1.matches(s.direction)]
         return ranked[: self.cfg.max_per_symbol]
 
     # ------------------------------------------------------------------
