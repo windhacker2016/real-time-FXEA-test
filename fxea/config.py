@@ -62,6 +62,7 @@ class MonitorConfig(BaseModel):
     interval_seconds: float = 60.0
     proactive_review_every: int = 10  # 每幾輪做一次主動檢視
     status_every: int = 5  # 每幾輪發一次狀態摘要
+    block_cooldown_minutes: int = 240  # 同商品、同樣風險阻擋原因在此期間內不重複產生備忘錄
 
 
 class AccountConfig(BaseModel):
@@ -75,15 +76,48 @@ class AlertConfig(BaseModel):
     webhook_url: Optional[str] = None
 
 
+class IGConfig(BaseModel):
+    """IG REST API(備用通道;主要通道建議用 IG 提供的 MT5)。"""
+
+    demo: bool = True
+    account_id: Optional[str] = None
+    epics: dict[str, str] = Field(
+        default_factory=lambda: {
+            "EURUSD": "CS.D.EURUSD.MINI.IP",
+            "GBPUSD": "CS.D.GBPUSD.MINI.IP",
+            "USDJPY": "CS.D.USDJPY.MINI.IP",
+            "AUDUSD": "CS.D.AUDUSD.MINI.IP",
+        }
+    )
+
+
+class MT5Config(BaseModel):
+    magic: int = 20260930
+    deviation: int = 20  # 允許滑價(點)
+    symbol_map: dict[str, str] = Field(default_factory=dict)  # 例如 {"EURUSD": "EURUSD.i"}
+
+
+class InstrumentOverride(BaseModel):
+    pip_size: Optional[float] = None
+    digits: Optional[int] = None
+    contract_size: Optional[float] = None  # IG 迷你合約 = 10000
+    lot_min: Optional[float] = None
+    lot_max: Optional[float] = None
+    lot_step: Optional[float] = None
+
+
 class Settings(BaseModel):
-    watchlist: list[str] = Field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
+    watchlist: list[str] = Field(default_factory=lambda: ["EURUSD"])
     timeframes: list[str] = Field(default_factory=lambda: ["H1", "H4"])
-    data_source: Literal["synthetic", "csv", "mt5"] = "synthetic"
+    data_source: Literal["synthetic", "csv", "mt5", "ig"] = "synthetic"
     csv_dir: Optional[str] = None
-    broker: Literal["paper", "mt5"] = "paper"
+    broker: Literal["paper", "mt5", "ig"] = "paper"
     state_dir: str = "state"
     news_file: Optional[str] = None
     synthetic_seed: int = 42
+    instruments: dict[str, InstrumentOverride] = Field(default_factory=dict)
+    ig: IGConfig = Field(default_factory=IGConfig)
+    mt5: MT5Config = Field(default_factory=MT5Config)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     signals: SignalConfig = Field(default_factory=SignalConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)

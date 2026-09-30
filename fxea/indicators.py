@@ -40,9 +40,10 @@ def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     loss = (-delta).clip(lower=0.0)
     avg_gain = gain.ewm(alpha=1.0 / n, adjust=False, min_periods=1).mean()
     avg_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=1).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    out = 100.0 - 100.0 / (1.0 + rs)
-    return out.fillna(100.0).where(avg_loss > 0, 100.0).where(avg_gain > 0, 50.0).fillna(50.0)
+    # RSI = 100 − 100/(1+G/L) ≡ 100·G/(G+L);G+L=0(完全沒動)時定義為 50
+    denom = avg_gain + avg_loss
+    values = np.where(denom > 0, 100.0 * avg_gain / denom.where(denom > 0, 1.0), 50.0)
+    return pd.Series(values, index=series.index)
 
 
 def roc(series: pd.Series, n: int) -> pd.Series:

@@ -1,12 +1,32 @@
 # FXEA 預設設定(圖 2 底部:模式 掃描 / 頻率 持續 / 時間週期 全天候 / 狀態 啟用)
-watchlist: [EURUSD, GBPUSD, USDJPY, AUDUSD]
+watchlist: [EURUSD]      # 主攻 EURUSD;可再加 GBPUSD, USDJPY ...
 timeframes: [H1, H4]
 
-data_source: synthetic   # synthetic | csv | mt5
-broker: paper            # paper | mt5
+data_source: synthetic   # synthetic | csv | mt5 | ig
+broker: paper            # paper | mt5 | ig
 state_dir: state
 synthetic_seed: 42
 # news_file: config/news.json
+
+# 即時模式建議(IG 帳戶 + 已安裝 MT5):
+#   data_source: mt5
+#   broker: mt5
+# 若要部署在沒有 MT5 的 Linux 主機,改用 IG REST(需 IG_API_KEY / IG_IDENTIFIER / IG_PASSWORD):
+#   data_source: ig
+#   broker: ig
+mt5:
+  magic: 20260930
+  deviation: 20
+  symbol_map: {}         # 券商代碼不同時對應,例如 {EURUSD: EURUSD.i}
+ig:
+  demo: true
+  account_id: null
+  epics:
+    EURUSD: CS.D.EURUSD.MINI.IP
+
+# 商品規格覆寫(IG REST 迷你合約 1 口 = 10000 單位 ≈ 1 美元/點)
+instruments: {}
+#  EURUSD: {contract_size: 10000, lot_min: 0.5, lot_step: 0.5}
 
 scanner:
   lookback: 200
@@ -56,6 +76,7 @@ monitor:
   interval_seconds: 60
   proactive_review_every: 10
   status_every: 5
+  block_cooldown_minutes: 240
 
 account:
   currency: USD
